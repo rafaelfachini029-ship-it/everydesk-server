@@ -1,6 +1,7 @@
 use crate::allowlist::{Allowlist, TEST_HBBS_ID};
 use crate::common::*;
 use crate::peer::*;
+use crate::requester_auth::{self, RelayKey, ReplayGuard};
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -90,6 +91,8 @@ pub struct RendezvousServer {
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
     allowlist: Option<Arc<Allowlist>>,
+    replay: Arc<ReplayGuard>,
+    relay_key: Option<Arc<RelayKey>>,
 }
 
 enum LoopFailure {
@@ -145,6 +148,8 @@ impl RendezvousServer {
                 local_ip,
             }),
             allowlist: Allowlist::from_env().map(Arc::new),
+            replay: Arc::new(ReplayGuard::new()),
+            relay_key: RelayKey::from_env().map(Arc::new),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -154,6 +159,10 @@ impl RendezvousServer {
                 std::env::var("ALLOWLIST_FILE").unwrap_or_default()
             );
         }
+        log::info!(
+            "relay uuid hmac: {}",
+            if rs.relay_key.is_some() { "enabled (RELAY_SECRET)" } else { "disabled" }
+        );
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
         let mut listener = create_tcp_listener(port).await?;
@@ -496,6 +505,46 @@ impl RendezvousServer {
         }
     }
 
+    /// EveryDesk: true when the requester's signed envelope in `licence_key`
+    /// does not authorize a punch/relay to `target_id` (see `requester_auth`).
+    async fn requester_denied(&self, licence_key: &str, target_id: &str, key: &str) -> bool {
+        let (my_id, reason) = match self.check_requester(licence_key, target_id, key).await {
+            Ok(()) => return false,
+            Err(e) => e,
+        };
+        log::info!("auth: denied {} -> {} ({})", my_id, target_id, reason);
+        true
+    }
+
+    async fn check_requester(
+        &self,
+        licence_key: &str,
+        target_id: &str,
+        key: &str,
+    ) -> Result<(), (String, &'static str)> {
+        let env = requester_auth::parse_envelope(licence_key)
+            .ok_or_else(|| ("?".to_owned(), "no v1 envelope"))?;
+        let fail = |reason| (env.my_id.clone(), reason);
+        if !key.is_empty() && env.server_key != key {
+            return Err(fail("server key mismatch"));
+        }
+        if let Some(a) = &self.allowlist {
+            if !a.is_allowed(&env.my_id) {
+                return Err(fail("requester not on allowlist"));
+            }
+        }
+        let pk = match self.pm.get(&env.my_id).await {
+            Some(peer) => peer.read().await.pk.clone(),
+            None => return Err(fail("unknown requester")),
+        };
+        let now = requester_auth::now_secs();
+        requester_auth::check(&env, target_id, &pk, now).map_err(fail)?;
+        if !self.replay.check_and_insert(&env.my_id, env.ts, now) {
+            return Err(fail("replay"));
+        }
+        Ok(())
+    }
+
     #[inline]
     async fn handle_tcp(
         &mut self,
@@ -511,6 +560,13 @@ impl RendezvousServer {
                     if self.is_denied(&ph.id) {
                         return false;
                     }
+                    // A wrong server key keeps its upstream answer (LICENSE_MISMATCH,
+                    // from handle_punch_hole_request); anything else must authenticate.
+                    let key_matches = key.is_empty()
+                        || requester_auth::server_key_part(&ph.licence_key) == key;
+                    if key_matches && self.requester_denied(&ph.licence_key, &ph.id, key).await {
+                        return false;
+                    }
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
@@ -521,6 +577,16 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
                     if self.is_denied(&rf.id) {
                         return false;
+                    }
+                    if self.requester_denied(&rf.licence_key, &rf.id, key).await {
+                        return false;
+                    }
+                    // the envelope is for hbbs only
+                    rf.licence_key = Default::default();
+                    if let Some(k) = &self.relay_key {
+                        if !rf.uuid.is_empty() {
+                            rf.uuid = k.sign_uuid(&rf.uuid);
+                        }
                     }
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
@@ -538,6 +604,13 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
                     rr.socket_addr = Default::default();
+                    // Only reaches addr_b if it is a requester socket that authenticated
+                    // (tcp_punch holds only those), so the tag is never handed to strangers.
+                    if let Some(k) = &self.relay_key {
+                        if !rr.uuid.is_empty() {
+                            rr.uuid = k.sign_uuid(&rr.uuid);
+                        }
+                    }
                     let id = rr.id();
                     if !id.is_empty() {
                         let pk = self.get_pk(&rr.version, id.to_owned()).await;
@@ -710,7 +783,7 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
-        if !key.is_empty() && ph.licence_key != key {
+        if !key.is_empty() && requester_auth::server_key_part(&ph.licence_key) != key {
             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {

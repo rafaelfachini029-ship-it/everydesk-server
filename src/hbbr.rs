@@ -1,6 +1,8 @@
 use clap::App;
 mod common;
 mod relay_server;
+#[allow(dead_code)]
+mod requester_auth;
 use flexi_logger::*;
 use hbb_common::{config::RELAY_PORT, ResultType};
 use relay_server::*;

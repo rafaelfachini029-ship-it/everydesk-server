@@ -31,7 +31,11 @@ use std::{
 type Usage = (usize, usize, usize, usize);
 
 lazy_static::lazy_static! {
-    static ref PEERS: Mutex<HashMap<String, Box<dyn StreamTrait>>> = Default::default();
+    // keyed by the uuid's base (before any `.`); the bool says whether that side
+    // presented a uuid carrying a valid hbbs HMAC (see requester_auth)
+    static ref PEERS: Mutex<HashMap<String, (bool, Box<dyn StreamTrait>)>> = Default::default();
+    static ref RELAY_KEY: Option<crate::requester_auth::RelayKey> =
+        crate::requester_auth::RelayKey::from_env();
     static ref USAGE: RwLock<HashMap<String, Usage>> = Default::default();
     static ref BLACKLIST: RwLock<HashSet<String>> = Default::default();
     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
@@ -48,6 +52,10 @@ const BLOCKLIST_FILE: &str = "blocklist.txt";
 #[tokio::main(flavor = "multi_thread")]
 pub async fn start(port: &str, key: &str) -> ResultType<()> {
     let key = get_server_sk(key);
+    log::info!(
+        "relay uuid hmac: {}",
+        if RELAY_KEY.is_some() { "enforced (RELAY_SECRET)" } else { "disabled" }
+    );
     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
@@ -432,9 +440,28 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                     return;
                 }
                 if !rf.uuid.is_empty() {
-                    let mut peer = PEERS.lock().await.remove(&rf.uuid);
-                    if let Some(peer) = peer.as_mut() {
-                        log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
+                    let base = crate::requester_auth::relay_uuid_base(&rf.uuid).to_owned();
+                    // Without RELAY_SECRET everything counts as authorized (upstream).
+                    let authorized = match RELAY_KEY.as_ref() {
+                        None => true,
+                        Some(k) if rf.uuid.contains('.') => {
+                            if !k.verify_uuid(&rf.uuid) {
+                                log::info!("relay: denied {} from {} (bad uuid hmac)", base, addr);
+                                return;
+                            }
+                            true
+                        }
+                        Some(_) => false,
+                    };
+                    let peer = PEERS.lock().await.remove(&base);
+                    if let Some((peer_authorized, mut peer)) = peer {
+                        // Exactly one side carries the tag hbbs issued: the requester in a
+                        // punch-initiated relay, the controlled side in a requested relay.
+                        if !authorized && !peer_authorized {
+                            log::info!("relay: denied {} from {} (no uuid hmac)", base, addr);
+                            return;
+                        }
+                        log::info!("Relayrequest {} from {} got paired", base, addr);
                         let id = format!("{}:{}", addr.ip(), addr.port());
                         USAGE.write().await.insert(id.clone(), Default::default());
                         if !stream.is_ws() && !peer.is_ws() {
@@ -442,7 +469,8 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                             stream.set_raw();
                             log::info!("Both are raw");
                         }
-                        if let Err(err) = relay(addr, &mut stream, peer, limiter, id.clone()).await
+                        if let Err(err) =
+                            relay(addr, &mut stream, &mut peer, limiter, id.clone()).await
                         {
                             log::info!("Relay of {} closed: {}", addr, err);
                         } else {
@@ -450,10 +478,13 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         }
                         USAGE.write().await.remove(&id);
                     } else {
-                        log::info!("New relay request {} from {}", rf.uuid, addr);
-                        PEERS.lock().await.insert(rf.uuid.clone(), Box::new(stream));
+                        log::info!("New relay request {} from {}", base, addr);
+                        PEERS
+                            .lock()
+                            .await
+                            .insert(base.clone(), (authorized, Box::new(stream)));
                         sleep(30.).await;
-                        PEERS.lock().await.remove(&rf.uuid);
+                        PEERS.lock().await.remove(&base);
                     }
                 }
             }
