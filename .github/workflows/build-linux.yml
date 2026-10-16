@@ -1,0 +1,50 @@
+name: build-linux
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main-everydesk
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build - amd64 musl
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: "1.90"
+          override: true
+          default: true
+          profile: minimal
+          target: x86_64-unknown-linux-musl
+
+      - name: Build
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --target=x86_64-unknown-linux-musl --bin hbbs --bin hbbr
+          use-cross: true
+
+      - name: Exec chmod
+        run: chmod -v a+x target/x86_64-unknown-linux-musl/release/hbbs target/x86_64-unknown-linux-musl/release/hbbr
+
+      - name: Publish Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hbbs-hbbr-linux-amd64
+          path: |
+            target/x86_64-unknown-linux-musl/release/hbbs
+            target/x86_64-unknown-linux-musl/release/hbbr
