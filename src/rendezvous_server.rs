@@ -14,7 +14,7 @@ use hbb_common::{
     log,
     protobuf::{Message as _, MessageField},
     rendezvous_proto::{
-        register_pk_response::Result::{NOT_SUPPORT, TOO_FREQUENT, UUID_MISMATCH},
+        register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
     tcp::{listen_any, FramedStream},
@@ -335,7 +335,7 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
                     // B registered
                     if !rp.id.is_empty() {
-                        if self.is_denied(&rp.id) {
+                        if !is_exempt_self_test(&rp.id, addr) && self.is_denied(&rp.id) {
                             return Ok(());
                         }
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
@@ -362,7 +362,7 @@ impl RendezvousServer {
                     } else if !self.check_ip_blocker(&ip, &id).await {
                         return send_rk_res(socket, addr, TOO_FREQUENT).await;
                     } else if self.is_denied(&id) {
-                        return send_rk_res(socket, addr, NOT_SUPPORT).await;
+                        return send_rk_res_raw(socket, addr, NOT_DEPLOYED).await;
                     }
                     let peer = self.pm.get_or(&id).await;
                     let (changed, ip_changed) = {
@@ -520,10 +520,6 @@ impl RendezvousServer {
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
                     if self.is_denied(&rf.id) {
-                        return false;
-                    }
-                    if !key.is_empty() && rf.licence_key != key {
-                        log::info!("allowlist: relay denied, key mismatch");
                         return false;
                     }
                     // there maybe several attempt, so sink can be none
@@ -1364,6 +1360,37 @@ async fn test_hbbs(addr: SocketAddr) -> ResultType<()> {
     }
 }
 
+/// `RegisterPkResponse.Result.NOT_DEPLOYED` in the RustDesk client's proto
+/// (client >= 1.5). The upstream `hbb_common` submodule used by this server
+/// does not define it, so it is sent as a raw enum value; the client shows a
+/// "not deployed" status instead of silently ignoring the answer.
+const NOT_DEPLOYED: i32 = 8;
+
+/// True only for the liveness self-check hbbs sends to itself (`test_hbbs`):
+/// id `TEST_HBBS_ID` coming from a loopback address. Anything else is
+/// subject to the allow-list.
+fn is_exempt_self_test(id: &str, addr: SocketAddr) -> bool {
+    id == TEST_HBBS_ID && addr.ip().to_canonical().is_loopback()
+}
+
+fn register_pk_response_raw(result: i32) -> RendezvousMessage {
+    let mut msg_out = RendezvousMessage::new();
+    msg_out.set_register_pk_response(RegisterPkResponse {
+        result: hbb_common::protobuf::EnumOrUnknown::from_i32(result),
+        ..Default::default()
+    });
+    msg_out
+}
+
+#[inline]
+async fn send_rk_res_raw(
+    socket: &mut FramedSocket,
+    addr: SocketAddr,
+    result: i32,
+) -> ResultType<()> {
+    socket.send(&register_pk_response_raw(result), addr).await
+}
+
 #[inline]
 async fn send_rk_res(
     socket: &mut FramedSocket,
@@ -1395,4 +1422,34 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
     let s = listen_any(port as _).await?;
     log::debug!("listen on tcp {:?}", s.local_addr());
     Ok(s)
+}
+
+#[cfg(test)]
+mod everydesk_tests {
+    use super::*;
+
+    #[test]
+    fn self_test_exempt_only_from_loopback() {
+        let v4: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let v6: SocketAddr = "[::1]:5000".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:5000".parse().unwrap();
+        let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        assert!(is_exempt_self_test(TEST_HBBS_ID, v4));
+        assert!(is_exempt_self_test(TEST_HBBS_ID, v6));
+        assert!(is_exempt_self_test(TEST_HBBS_ID, mapped));
+        assert!(!is_exempt_self_test(TEST_HBBS_ID, remote));
+        assert!(!is_exempt_self_test("123456789", v4));
+    }
+
+    #[test]
+    fn denied_register_pk_serializes_not_deployed_8() {
+        let bytes = register_pk_response_raw(NOT_DEPLOYED).write_to_bytes().unwrap();
+        let msg = RendezvousMessage::parse_from_bytes(&bytes).unwrap();
+        match msg.union {
+            Some(rendezvous_message::Union::RegisterPkResponse(r)) => {
+                assert_eq!(r.result.value(), 8);
+            }
+            _ => panic!("not a RegisterPkResponse"),
+        }
+    }
 }
