@@ -11,7 +11,7 @@
 
 use sodiumoxide::crypto::{auth::hmacsha256, hash::sha256, sign};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 
 pub const VERSION_TAG: &str = "v1";
@@ -123,18 +123,163 @@ pub fn relay_response_uuid(
     }
 }
 
-/// Timestamp window and signature; `Err` carries the reason for the log.
+/// Timestamp window and signature of a punch/relay envelope; `Err` carries the
+/// reason for the log.
 pub fn check(env: &Envelope, target_id: &str, pk: &[u8], now: i64) -> Result<(), &'static str> {
+    check_signed(env, &signed_message(&env.my_id, target_id, env.ts), pk, now)
+}
+
+fn check_signed(env: &Envelope, msg: &str, pk: &[u8], now: i64) -> Result<(), &'static str> {
     if now.abs_diff(env.ts) > MAX_SKEW_SECS as u64 {
         return Err("timestamp out of window");
     }
     let pk = sign::PublicKey::from_slice(pk).ok_or("requester has no valid pk")?;
     let sig = sign::Signature::from_bytes(&env.sig).map_err(|_| "bad signature")?;
-    let msg = signed_message(&env.my_id, target_id, env.ts);
     if sign::verify_detached(&sig, msg.as_bytes(), &pk) {
         Ok(())
     } else {
         Err("bad signature")
+    }
+}
+
+// ---- Presence (OnlineRequest on hbbs' port-1) ----
+//
+// `OnlineRequest.id` carries the same envelope, signed over
+// `ed-online-v1|<my_id>|<ts>` (its own domain, so a punch signature never
+// authorizes a presence query and vice versa).
+
+pub const ONLINE_CONTEXT: &str = "ed-online-v1";
+/// Most peers one `OnlineRequest` may ask about.
+pub const ONLINE_MAX_PEERS: usize = 200;
+/// One `OnlineRequest` per requester id, and per source IP, every this many seconds.
+pub const ONLINE_MIN_INTERVAL_SECS: i64 = 5;
+
+/// The message a presence requester signs.
+pub fn online_message(my_id: &str, ts: i64) -> String {
+    format!("{ONLINE_CONTEXT}|{my_id}|{ts}")
+}
+
+pub fn check_online(env: &Envelope, pk: &[u8], now: i64) -> Result<(), &'static str> {
+    check_signed(env, &online_message(&env.my_id, env.ts), pk, now)
+}
+
+/// The requester id when `envelope` is a valid presence envelope signed with `pk`
+/// within the time window (no replay or rate bookkeeping).
+pub fn verify_online(envelope: &str, pk: &[u8], now: i64) -> Option<String> {
+    let env = parse_envelope(envelope)?;
+    check_online(&env, pk, now).ok()?;
+    Some(env.my_id)
+}
+
+/// Fixed-interval limiter: one `allow` per key every `interval` seconds. Entries
+/// older than the interval are dropped on every call, so its size is bounded by
+/// the requests of the last `interval` seconds.
+pub struct RateLimiter<K> {
+    interval: i64,
+    last: Mutex<HashMap<K, i64>>,
+}
+
+impl<K: std::hash::Hash + Eq> RateLimiter<K> {
+    pub fn new(interval: i64) -> Self {
+        Self {
+            interval,
+            last: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn allow(&self, key: K, now: i64) -> bool {
+        let interval = self.interval;
+        let mut last = self.last.lock().unwrap();
+        // saturating: a clock jump must not overflow; a past-dated entry stays put
+        last.retain(|_, t| now.saturating_sub(*t) < interval);
+        if last.contains_key(&key) {
+            return false;
+        }
+        last.insert(key, now);
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.last.lock().unwrap().len()
+    }
+}
+
+#[derive(Debug)]
+pub enum OnlineDenial {
+    /// Reason for the log; the requester gets no answer.
+    Denied(&'static str),
+    /// Sanitized id or the IP that hit the limit; no answer either.
+    RateLimited(String),
+}
+
+/// hbbs' admission check for `OnlineRequest`, in two stages around the async
+/// allowlist/pk lookup: `precheck` (cheap, before any lookup) then `admit`.
+pub struct OnlineGate {
+    by_ip: RateLimiter<IpAddr>,
+    by_id: RateLimiter<String>,
+    replay: ReplayGuard,
+}
+
+impl Default for OnlineGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OnlineGate {
+    pub fn new() -> Self {
+        Self {
+            by_ip: RateLimiter::new(ONLINE_MIN_INTERVAL_SECS),
+            by_id: RateLimiter::new(ONLINE_MIN_INTERVAL_SECS),
+            replay: ReplayGuard::new(),
+        }
+    }
+
+    /// Per-IP limit (every request spends its address' slot, valid or not), the
+    /// 200-peer cap, the envelope shape and the server key.
+    pub fn precheck(
+        &self,
+        id_field: &str,
+        peers_len: usize,
+        ip: IpAddr,
+        key: &str,
+        now: i64,
+    ) -> Result<Envelope, OnlineDenial> {
+        if !self.by_ip.allow(ip, now) {
+            return Err(OnlineDenial::RateLimited(ip.to_string()));
+        }
+        if peers_len > ONLINE_MAX_PEERS {
+            return Err(OnlineDenial::Denied("too many peers"));
+        }
+        let env = parse_envelope(id_field).ok_or(OnlineDenial::Denied("no v1 envelope"))?;
+        if !key.is_empty() && env.server_key != key {
+            return Err(OnlineDenial::Denied("server key mismatch"));
+        }
+        Ok(env)
+    }
+
+    /// Allowlist, signature against the requester's registered `pk`, replay, and
+    /// the per-id limit (spent only by authenticated requests, so a forger cannot
+    /// starve someone else's id). `Ok` carries the requester id.
+    pub fn admit(
+        &self,
+        env: &Envelope,
+        allowed: bool,
+        pk: Option<&[u8]>,
+        now: i64,
+    ) -> Result<String, OnlineDenial> {
+        if !allowed {
+            return Err(OnlineDenial::Denied("requester not on allowlist"));
+        }
+        let pk = pk.ok_or(OnlineDenial::Denied("unknown requester"))?;
+        check_online(env, pk, now).map_err(OnlineDenial::Denied)?;
+        if !self.replay.check_and_insert(&env.my_id, env.ts, now) {
+            return Err(OnlineDenial::Denied("replay"));
+        }
+        if !self.by_id.allow(env.my_id.clone(), now) {
+            return Err(OnlineDenial::RateLimited(sanitize_id(&env.my_id)));
+        }
+        Ok(env.my_id.clone())
     }
 }
 
@@ -354,6 +499,142 @@ mod tests {
         assert!(guard.check_and_insert("111", NOW + 1, NOW + 1));
         // after the window the entry has expired (the 30 s skew check rejects it anyway)
         assert!(guard.check_and_insert("111", NOW, NOW + 61));
+    }
+
+    fn online_envelope(sk: &sign::SecretKey, my_id: &str, ts: i64) -> String {
+        let msg = format!("ed-online-v1|{my_id}|{ts}");
+        let sig = sign::sign_detached(msg.as_bytes(), sk);
+        format!("SRVKEY;v1;{my_id};{ts};{}", base64::encode(sig.as_ref()))
+    }
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// Runs both gate stages the way hbbs does (allow-listed, pk known).
+    fn admit(
+        gate: &OnlineGate,
+        id_field: &str,
+        peers: usize,
+        from: &str,
+        pk: &sign::PublicKey,
+        now: i64,
+    ) -> Result<String, OnlineDenial> {
+        let env = gate.precheck(id_field, peers, ip(from), "SRVKEY", now)?;
+        gate.admit(&env, true, Some(pk.as_ref()), now)
+    }
+
+    #[test]
+    fn verify_online_uses_its_own_domain() {
+        let (pk, sk) = sign::gen_keypair();
+        let env = online_envelope(&sk, "111", NOW);
+        assert_eq!(verify_online(&env, pk.as_ref(), NOW + 3).as_deref(), Some("111"));
+        assert!(verify_online(&env, pk.as_ref(), NOW + 31).is_none());
+        // a punch envelope (any target) is not an online envelope
+        let punch = envelope(&sk, "111", "", NOW);
+        assert!(verify_online(&punch, pk.as_ref(), NOW).is_none());
+        // nor the other way round
+        let p = parse_envelope(&env).unwrap();
+        assert!(!verify(&p, "", pk.as_ref(), NOW));
+        assert!(verify_online("SRVKEY", pk.as_ref(), NOW).is_none());
+    }
+
+    #[test]
+    fn online_request_rejects_unsigned() {
+        let gate = OnlineGate::new();
+        let (pk, sk) = sign::gen_keypair();
+        let (other_pk, _) = sign::gen_keypair();
+        // stock client: `id` is the plain requester id
+        assert!(matches!(
+            admit(&gate, "111", 3, "1.1.1.1", &pk, NOW),
+            Err(OnlineDenial::Denied(_))
+        ));
+        // signed by somebody else's key
+        let env = online_envelope(&sk, "111", NOW);
+        assert!(matches!(
+            admit(&gate, &env, 3, "1.1.1.2", &other_pk, NOW),
+            Err(OnlineDenial::Denied(_))
+        ));
+        // wrong server key
+        let wrong = env.replacen("SRVKEY", "OTHER", 1);
+        assert!(matches!(
+            admit(&gate, &wrong, 3, "1.1.1.3", &pk, NOW),
+            Err(OnlineDenial::Denied(_))
+        ));
+        // not allow-listed / unknown requester
+        let e = gate.precheck(&env, 3, ip("1.1.1.4"), "SRVKEY", NOW).unwrap();
+        assert!(matches!(
+            gate.admit(&e, false, Some(pk.as_ref()), NOW),
+            Err(OnlineDenial::Denied(_))
+        ));
+        assert!(matches!(gate.admit(&e, true, None, NOW), Err(OnlineDenial::Denied(_))));
+        // the genuine one passes
+        assert_eq!(admit(&gate, &env, 3, "1.1.1.5", &pk, NOW).unwrap(), "111");
+        // and cannot be replayed (after the per-id interval) from another address
+        assert!(admit(&gate, &env, 3, "1.1.1.6", &pk, NOW + 10).is_err());
+    }
+
+    #[test]
+    fn online_request_caps_200() {
+        let gate = OnlineGate::new();
+        let (pk, sk) = sign::gen_keypair();
+        let env = online_envelope(&sk, "111", NOW);
+        assert!(matches!(
+            admit(&gate, &env, 201, "2.2.2.1", &pk, NOW),
+            Err(OnlineDenial::Denied(_))
+        ));
+        let env = online_envelope(&sk, "111", NOW + 1);
+        assert_eq!(admit(&gate, &env, 200, "2.2.2.2", &pk, NOW + 1).unwrap(), "111");
+    }
+
+    #[test]
+    fn online_rate_limit_per_id() {
+        let gate = OnlineGate::new();
+        let (pk, sk) = sign::gen_keypair();
+        let a = |ts: i64, from: &str, now: i64| {
+            admit(&gate, &online_envelope(&sk, "111", ts), 1, from, &pk, now)
+        };
+        assert!(a(NOW, "3.3.3.1", NOW).is_ok());
+        // same id from another address within 5 s: limited
+        assert!(matches!(
+            a(NOW + 1, "3.3.3.2", NOW + 1),
+            Err(OnlineDenial::RateLimited(id)) if id == "111"
+        ));
+        assert!(a(NOW + 5, "3.3.3.3", NOW + 5).is_ok());
+        // same address, other id, within 5 s: limited per IP
+        let (pk2, sk2) = sign::gen_keypair();
+        let env2 = online_envelope(&sk2, "222", NOW + 6);
+        assert!(matches!(
+            admit(&gate, &env2, 1, "3.3.3.3", &pk2, NOW + 6),
+            Err(OnlineDenial::RateLimited(_))
+        ));
+        // an unsigned request still spends its address' slot
+        assert!(admit(&gate, "222", 1, "3.3.3.9", &pk2, NOW + 6).is_err());
+        assert!(matches!(
+            admit(&gate, &env2, 1, "3.3.3.9", &pk2, NOW + 7),
+            Err(OnlineDenial::RateLimited(_))
+        ));
+        // a forged request for "111" does not spend 111's slot
+        let (_, evil) = sign::gen_keypair();
+        assert!(a(NOW + 12, "4.4.4.4", NOW + 12).is_ok());
+        let forged = online_envelope(&evil, "111", NOW + 17);
+        assert!(admit(&gate, &forged, 1, "4.4.4.5", &pk, NOW + 17).is_err());
+        assert!(a(NOW + 17, "4.4.4.6", NOW + 17).is_ok());
+    }
+
+    #[test]
+    fn rate_limiter_one_per_5s() {
+        let rl: RateLimiter<String> = RateLimiter::new(ONLINE_MIN_INTERVAL_SECS);
+        assert!(rl.allow("a".into(), NOW));
+        assert!(!rl.allow("a".into(), NOW + 4));
+        assert!(rl.allow("b".into(), NOW + 4));
+        assert!(rl.allow("a".into(), NOW + 5));
+        assert!(!rl.allow("a".into(), NOW + 9));
+        // clock going backwards never panics nor opens a slot early
+        assert!(!rl.allow("a".into(), NOW));
+        // old entries are dropped
+        assert!(rl.allow("c".into(), NOW + 100));
+        assert_eq!(rl.len(), 1);
     }
 
     #[test]

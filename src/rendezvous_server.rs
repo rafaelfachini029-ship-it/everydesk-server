@@ -1,7 +1,7 @@
 use crate::allowlist::{Allowlist, TEST_HBBS_ID};
 use crate::common::*;
 use crate::peer::*;
-use crate::requester_auth::{self, AuthedRequesters, RelayKey, ReplayGuard};
+use crate::requester_auth::{self, AuthedRequesters, OnlineDenial, OnlineGate, RelayKey, ReplayGuard};
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -94,6 +94,7 @@ pub struct RendezvousServer {
     replay: Arc<ReplayGuard>,
     authed: Arc<AuthedRequesters>,
     relay_key: Option<Arc<RelayKey>>,
+    online_gate: Arc<OnlineGate>,
 }
 
 enum LoopFailure {
@@ -152,6 +153,7 @@ impl RendezvousServer {
             replay: Arc::new(ReplayGuard::new()),
             authed: Arc::new(AuthedRequesters::new()),
             relay_key: RelayKey::from_env().map(Arc::new),
+            online_gate: Arc::new(OnlineGate::new()),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -297,7 +299,7 @@ impl RendezvousServer {
                     match res {
                         Ok((stream, addr))  => {
                             stream.set_nodelay(true).ok();
-                            self.handle_listener2(stream, addr).await;
+                            self.handle_listener2(stream, addr, key).await;
                         }
                         Err(err) => {
                            log::error!("listener2.accept failed: {}", err);
@@ -920,6 +922,51 @@ impl RendezvousServer {
         }
     }
 
+    /// EveryDesk: `OnlineRequest.id` must be a presence envelope (see
+    /// `requester_auth::OnlineGate`) from an allow-listed, registered requester;
+    /// at most 200 peers; one request per 5 s per id and per source IP.
+    async fn online_admitted(
+        &self,
+        id_field: &str,
+        peers_len: usize,
+        addr: SocketAddr,
+        key: &str,
+    ) -> bool {
+        let gate = &self.online_gate;
+        let now = requester_auth::now_secs();
+        let ip = try_into_v4(addr).ip();
+        let res = match gate.precheck(id_field, peers_len, ip, key, now) {
+            Ok(env) => {
+                let allowed = self
+                    .allowlist
+                    .as_ref()
+                    .map_or(true, |a| a.is_allowed(&env.my_id));
+                let pk = if allowed {
+                    match self.pm.get(&env.my_id).await {
+                        Some(peer) => Some(peer.read().await.pk.clone()),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                gate.admit(&env, allowed, pk.as_deref(), now)
+                    .map_err(|e| (requester_auth::sanitize_id(&env.my_id), e))
+            }
+            Err(e) => Err(("?".to_owned(), e)),
+        };
+        match res {
+            Ok(_) => true,
+            Err((_, OnlineDenial::RateLimited(who))) => {
+                log::info!("online: rate limited {}", who);
+                false
+            }
+            Err((id, OnlineDenial::Denied(reason))) => {
+                log::info!("online: denied {} ({})", id, reason);
+                false
+            }
+        }
+    }
+
     #[inline]
     async fn handle_online_request(
         &mut self,
@@ -1230,8 +1277,9 @@ impl RendezvousServer {
         res
     }
 
-    async fn handle_listener2(&self, stream: TcpStream, addr: SocketAddr) {
+    async fn handle_listener2(&self, stream: TcpStream, addr: SocketAddr, key: &str) {
         let mut rs = self.clone();
+        let key = key.to_owned();
         let ip = try_into_v4(addr).ip();
         if ip.is_loopback() {
             tokio::spawn(async move {
@@ -1261,7 +1309,10 @@ impl RendezvousServer {
                             stream.send(&msg_out).await.ok();
                         }
                         Some(rendezvous_message::Union::OnlineRequest(or)) => {
-                            allow_err!(rs.handle_online_request(&mut stream, or.peers).await);
+                            // EveryDesk: unauthorized or over-limit requests get no answer.
+                            if rs.online_admitted(&or.id, or.peers.len(), addr, &key).await {
+                                allow_err!(rs.handle_online_request(&mut stream, or.peers).await);
+                            }
                         }
                         _ => {}
                     }

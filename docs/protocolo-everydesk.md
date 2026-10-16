@@ -74,3 +74,28 @@ só roda com token/switch code ou WebRTC). Quem estiver no caminho (on-path) con
 
 Não consegue forjar envelope para outro alvo ou outro ID (a assinatura amarra
 `my_id`, alvo e ts), nem obter tag de relay sem antes autenticar.
+
+## Presença (`OnlineRequest`, porta 21115)
+
+O `OnlineRequest` (consulta de quais peers estão online, resposta em bitmap) também
+exige o envelope, agora no campo `id`:
+
+```
+<server_key>;v1;<my_id>;<unix_ts>;<base64 sig>
+```
+
+com `sig` = ed25519 *detached* de `ed-online-v1|<my_id>|<unix_ts>` (domínio
+próprio: uma assinatura de punch não vale para presença e vice-versa). O hbbs
+(`requester_auth::OnlineGate`), em ordem:
+
+1. no máximo 1 pedido a cada 5 s por IP de origem (todo pedido conta, válido ou não);
+2. `peers.len() ≤ 200`;
+3. envelope `v1` com a chave do servidor;
+4. `my_id` na allow-list e com `pk` registrado; assinatura e janela de ±30 s;
+5. anti-replay `(my_id, ts)` por 60 s (separado do de punch);
+6. no máximo 1 pedido a cada 5 s por `my_id` (só pedidos autenticados contam, então
+   um forjador não consome a cota de outro ID).
+
+Falha: conexão fechada sem resposta; log `online: denied <my_id> (<motivo>)` ou
+`online: rate limited <my_id|ip>`. A resposta para quem passa é a mesma de upstream.
+Clientes RustDesk comuns deixam de ver presença por este servidor.
