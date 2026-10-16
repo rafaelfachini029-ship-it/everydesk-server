@@ -45,6 +45,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: hbbs-hbbr-linux-amd64
+          if-no-files-found: error
           path: |
             target/x86_64-unknown-linux-musl/release/hbbs
             target/x86_64-unknown-linux-musl/release/hbbr
