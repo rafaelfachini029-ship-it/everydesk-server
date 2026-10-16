@@ -151,8 +151,10 @@ fn check_signed(env: &Envelope, msg: &str, pk: &[u8], now: i64) -> Result<(), &'
 pub const ONLINE_CONTEXT: &str = "ed-online-v1";
 /// Most peers one `OnlineRequest` may ask about.
 pub const ONLINE_MAX_PEERS: usize = 200;
-/// One `OnlineRequest` per requester id, and per source IP, every this many seconds.
+/// One `OnlineRequest` per requester id every this many seconds.
 pub const ONLINE_MIN_INTERVAL_SECS: i64 = 5;
+/// `OnlineRequest`s per source IP in the same window (several machines behind one NAT).
+pub const ONLINE_IP_BUDGET: u32 = 10;
 
 /// The message a presence requester signs.
 pub fn online_message(my_id: &str, ts: i64) -> String {
@@ -171,18 +173,27 @@ pub fn verify_online(envelope: &str, pk: &[u8], now: i64) -> Option<String> {
     Some(env.my_id)
 }
 
-/// Fixed-interval limiter: one `allow` per key every `interval` seconds. Entries
-/// older than the interval are dropped on every call, so its size is bounded by
-/// the requests of the last `interval` seconds.
+/// Fixed-window limiter: at most `budget` `allow`s per key in a window of
+/// `interval` seconds that starts at the key's first request. Expired windows
+/// are dropped on every call, so its size is bounded by the keys active in the
+/// last `interval` seconds.
 pub struct RateLimiter<K> {
     interval: i64,
-    last: Mutex<HashMap<K, i64>>,
+    budget: u32,
+    /// key -> (window start, requests allowed in it)
+    last: Mutex<HashMap<K, (i64, u32)>>,
 }
 
 impl<K: std::hash::Hash + Eq> RateLimiter<K> {
+    /// One request per key every `interval` seconds.
     pub fn new(interval: i64) -> Self {
+        Self::with_budget(interval, 1)
+    }
+
+    pub fn with_budget(interval: i64, budget: u32) -> Self {
         Self {
             interval,
+            budget,
             last: Mutex::new(HashMap::new()),
         }
     }
@@ -190,12 +201,13 @@ impl<K: std::hash::Hash + Eq> RateLimiter<K> {
     pub fn allow(&self, key: K, now: i64) -> bool {
         let interval = self.interval;
         let mut last = self.last.lock().unwrap();
-        // saturating: a clock jump must not overflow; a past-dated entry stays put
-        last.retain(|_, t| now.saturating_sub(*t) < interval);
-        if last.contains_key(&key) {
+        // saturating: a clock jump must not overflow; a past-dated window stays put
+        last.retain(|_, (start, _)| now.saturating_sub(*start) < interval);
+        let entry = last.entry(key).or_insert((now, 0));
+        if entry.1 >= self.budget {
             return false;
         }
-        last.insert(key, now);
+        entry.1 += 1;
         true
     }
 
@@ -229,13 +241,13 @@ impl Default for OnlineGate {
 impl OnlineGate {
     pub fn new() -> Self {
         Self {
-            by_ip: RateLimiter::new(ONLINE_MIN_INTERVAL_SECS),
+            by_ip: RateLimiter::with_budget(ONLINE_MIN_INTERVAL_SECS, ONLINE_IP_BUDGET),
             by_id: RateLimiter::new(ONLINE_MIN_INTERVAL_SECS),
             replay: ReplayGuard::new(),
         }
     }
 
-    /// Per-IP limit (every request spends its address' slot, valid or not), the
+    /// Per-IP budget (every request spends from its address' budget, valid or not), the
     /// 200-peer cap, the envelope shape and the server key.
     pub fn precheck(
         &self,
@@ -601,25 +613,57 @@ mod tests {
             Err(OnlineDenial::RateLimited(id)) if id == "111"
         ));
         assert!(a(NOW + 5, "3.3.3.3", NOW + 5).is_ok());
-        // same address, other id, within 5 s: limited per IP
+        // same address, other id, within 5 s: fine (per-IP budget is 10 per 5 s)
         let (pk2, sk2) = sign::gen_keypair();
         let env2 = online_envelope(&sk2, "222", NOW + 6);
-        assert!(matches!(
-            admit(&gate, &env2, 1, "3.3.3.3", &pk2, NOW + 6),
-            Err(OnlineDenial::RateLimited(_))
-        ));
-        // an unsigned request still spends its address' slot
-        assert!(admit(&gate, "222", 1, "3.3.3.9", &pk2, NOW + 6).is_err());
-        assert!(matches!(
-            admit(&gate, &env2, 1, "3.3.3.9", &pk2, NOW + 7),
-            Err(OnlineDenial::RateLimited(_))
-        ));
+        assert!(admit(&gate, &env2, 1, "3.3.3.3", &pk2, NOW + 6).is_ok());
         // a forged request for "111" does not spend 111's slot
         let (_, evil) = sign::gen_keypair();
         assert!(a(NOW + 12, "4.4.4.4", NOW + 12).is_ok());
         let forged = online_envelope(&evil, "111", NOW + 17);
         assert!(admit(&gate, &forged, 1, "4.4.4.5", &pk, NOW + 17).is_err());
         assert!(a(NOW + 17, "4.4.4.6", NOW + 17).is_ok());
+    }
+
+    #[test]
+    fn online_ip_budget_10_per_5s() {
+        let gate = OnlineGate::new();
+        // ten machines behind one NAT, each polling once
+        for i in 0..ONLINE_IP_BUDGET {
+            let (pk, sk) = sign::gen_keypair();
+            let id = format!("n{i}");
+            let env = online_envelope(&sk, &id, NOW);
+            assert_eq!(admit(&gate, &env, 1, "5.5.5.5", &pk, NOW).unwrap(), id);
+        }
+        // the eleventh request in the window, even unsigned, is limited by IP
+        let (pk, sk) = sign::gen_keypair();
+        let env = online_envelope(&sk, "n10", NOW + 1);
+        assert!(matches!(
+            admit(&gate, &env, 1, "5.5.5.5", &pk, NOW + 1),
+            Err(OnlineDenial::RateLimited(ip)) if ip == "5.5.5.5"
+        ));
+        assert!(admit(&gate, "junk", 1, "5.5.5.5", &pk, NOW + 1).is_err());
+        // another address is independent; the window reopens after 5 s
+        assert!(admit(&gate, &env, 1, "5.5.5.6", &pk, NOW + 1).is_ok());
+        let env = online_envelope(&sk, "n10", NOW + 6);
+        assert!(admit(&gate, &env, 1, "5.5.5.5", &pk, NOW + 6).is_ok());
+    }
+
+    #[test]
+    fn rate_limiter_budget() {
+        let rl: RateLimiter<u8> = RateLimiter::with_budget(5, 3);
+        assert!(rl.allow(1, NOW));
+        assert!(rl.allow(1, NOW + 1));
+        assert!(rl.allow(1, NOW + 4));
+        assert!(!rl.allow(1, NOW + 4));
+        assert!(rl.allow(2, NOW + 4));
+        // window counted from its first request
+        assert!(rl.allow(1, NOW + 5));
+        assert!(rl.allow(1, NOW + 5));
+        assert!(rl.allow(1, NOW + 9));
+        assert!(!rl.allow(1, NOW + 9));
+        // backwards clock: no early reopening
+        assert!(!rl.allow(1, NOW));
     }
 
     #[test]

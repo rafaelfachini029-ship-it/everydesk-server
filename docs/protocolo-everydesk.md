@@ -88,7 +88,7 @@ com `sig` = ed25519 *detached* de `ed-online-v1|<my_id>|<unix_ts>` (domínio
 próprio: uma assinatura de punch não vale para presença e vice-versa). O hbbs
 (`requester_auth::OnlineGate`), em ordem:
 
-1. no máximo 1 pedido a cada 5 s por IP de origem (todo pedido conta, válido ou não);
+1. no máximo 10 pedidos a cada 5 s por IP de origem (todo pedido conta, válido ou não). A cota é por IP e não 1 porque várias máquinas atrás do mesmo NAT (casa, escritório) compartilham o IP; com mais de ~10 EveryDesk sondando atrás de um NAT, alguns pedidos ficam sem resposta e o app mantém o último estado conhecido;
 2. `peers.len() ≤ 200`;
 3. envelope `v1` com a chave do servidor;
 4. `my_id` na allow-list e com `pk` registrado; assinatura e janela de ±30 s;
