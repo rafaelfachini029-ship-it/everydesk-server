@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const COOKIE: &str = "ed_session";
 const MAX_FAILS: u32 = 5;
 const LOCKOUT: Duration = Duration::from_secs(600);
+const SESSION_TTL: Duration = Duration::from_secs(86400);
 const MAX_SESSIONS: usize = 100;
 
 pub struct AppState {
@@ -24,9 +25,9 @@ pub struct AppState {
     pending: PathBuf,
     blocked: PathBuf,
     /// session token -> csrf token
-    sessions: Mutex<HashMap<String, String>>,
-    /// client key -> (failures, locked until)
-    fails: Mutex<HashMap<String, (u32, Option<Instant>)>>,
+    sessions: Mutex<HashMap<String, (String, Instant)>>,
+    /// client key -> (failures, locked until, last failure)
+    fails: Mutex<HashMap<String, (u32, Option<Instant>, Instant)>>,
     /// serializes read-modify-write on the files
     io: Mutex<()>,
 }
@@ -165,6 +166,12 @@ fn remove_id(p: &PathBuf, id: &str) -> std::io::Result<()> {
 fn write_atomic(p: &PathBuf, content: &str) -> std::io::Result<()> {
     let tmp = p.with_extension("tmp-admin");
     std::fs::write(&tmp, content)?;
+    // keep the original mode and owner (the panel may run as root over hbbs-owned files)
+    if let Ok(m) = std::fs::metadata(p) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(m.mode() & 0o7777));
+        let _ = std::os::unix::fs::chown(&tmp, Some(m.uid()), Some(m.gid()));
+    }
     std::fs::rename(&tmp, p)
 }
 
@@ -184,8 +191,17 @@ fn session_of(st: &AppState, h: &HeaderMap) -> Option<(String, String)> {
         .filter_map(|p| p.trim().split_once('='))
         .find(|(k, _)| *k == COOKIE)?
         .1;
-    let s = st.sessions.lock().unwrap();
-    s.get(tok).map(|c| (tok.to_string(), c.clone()))
+    let mut s = st.sessions.lock().unwrap();
+    match s.get(tok) {
+        Some((csrf, created)) if created.elapsed() < SESSION_TTL => {
+            Some((tok.to_string(), csrf.clone()))
+        }
+        Some(_) => {
+            s.remove(tok);
+            None
+        }
+        None => None,
+    }
 }
 
 fn page(title: &str, body: &str) -> Html<String> {
@@ -233,7 +249,7 @@ async fn login(State(st): State<St>, headers: HeaderMap, Form(f): Form<LoginForm
     let key = client_key(&headers);
     {
         let fails = st.fails.lock().unwrap();
-        if let Some((_, Some(until))) = fails.get(&key) {
+        if let Some((_, Some(until), _)) = fails.get(&key) {
             if Instant::now() < *until {
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
@@ -245,9 +261,15 @@ async fn login(State(st): State<St>, headers: HeaderMap, Form(f): Form<LoginForm
     }
     if !ct_eq(f.password.as_bytes(), st.password.as_bytes()) {
         let mut fails = st.fails.lock().unwrap();
-        let e = fails.entry(key).or_insert((0, None));
+        let now = Instant::now();
+        fails.retain(|_, (_, lock, last)| match lock {
+            Some(u) => now < *u,
+            None => now.duration_since(*last) < LOCKOUT,
+        });
+        let e = fails.entry(key).or_insert((0, None, now));
+        e.2 = now;
         if matches!(e.1, Some(u) if Instant::now() >= u) {
-            *e = (0, None);
+            *e = (0, None, now);
         }
         e.0 += 1;
         if e.0 >= MAX_FAILS {
@@ -262,7 +284,8 @@ async fn login(State(st): State<St>, headers: HeaderMap, Form(f): Form<LoginForm
         if s.len() >= MAX_SESSIONS {
             s.clear();
         }
-        s.insert(tok.clone(), token());
+        s.retain(|_, (_, t)| t.elapsed() < SESSION_TTL);
+        s.insert(tok.clone(), (token(), Instant::now()));
     }
     let cookie = format!(
         "{}={}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400",
@@ -357,12 +380,20 @@ async fn index(State(st): State<St>, headers: HeaderMap) -> Response {
             continue;
         }
         let comment = l.split_once('#').map(|x| x.1.trim()).unwrap_or("");
+        let buttons = if valid_id(id) {
+            format!(
+                "{}{}",
+                btn("remove", id, &csrf, "Remover", "gray"),
+                btn("block", id, &csrf, "Bloquear", "red")
+            )
+        } else {
+            "<span class=\"empty\">edite o arquivo</span>".to_string()
+        };
         rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
             esc(id),
             esc(comment),
-            btn("remove", id, &csrf, "Remover", "gray"),
-            btn("block", id, &csrf, "Bloquear", "red")
+            buttons
         ));
     }
     if rows.is_empty() {
@@ -604,5 +635,16 @@ mod tests {
             let want = if i < 5 { StatusCode::UNAUTHORIZED } else { StatusCode::TOO_MANY_REQUESTS };
             assert_eq!(r.status(), want, "attempt {}", i);
         }
+    }
+
+    #[tokio::test]
+    async fn write_keeps_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (st, allow, _) = setup("mode");
+        std::fs::set_permissions(&allow, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let (cookie, csrf) = login_ok(&st).await;
+        assert_eq!(post(&st, "/remove/111111", &cookie, &csrf).await, StatusCode::SEE_OTHER);
+        let mode = std::fs::metadata(&allow).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
     }
 }

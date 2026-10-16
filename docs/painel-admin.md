@@ -5,7 +5,7 @@ Painel web para aprovar, bloquear e remover máquinas da allow-list do hbbs.
 - URL: https://everydesk.vpsfachini.online (login por senha única).
 - Pendentes: quando o hbbs nega um `RegisterPk` por falta na allow-list, ele anexa `<id> <unix_ts>` em `PENDING_FILE` (`/var/lib/rustdesk-server/pending.txt`, sem duplicatas, máx. 500 linhas).
 - Aprovar: acrescenta `<id> # aprovado AAAA-MM-DD` em `/var/lib/rustdesk-server/allowed.txt` (o hbbs relê o arquivo sozinho, sem restart).
-- Bloquear: grava em `blocked.txt` (mesma pasta), tira de pendentes e aprovados. Remover: tira só do `allowed.txt`, mantendo as demais linhas.
+- Bloquear: grava em `blocked.txt` (mesma pasta; é só controle do painel, o hbbs nunca lê esse arquivo — o efeito vem de sair do `allowed.txt`), tira de pendentes e aprovados. Remover: tira só do `allowed.txt`, mantendo as demais linhas.
 - Segurança: cookie de sessão HttpOnly/Secure/SameSite=Strict, token CSRF em todo POST, 5 senhas erradas por IP = bloqueio de 10 min. Escuta só em `127.0.0.1:3300`; o Caddy faz o HTTPS.
 
 ## Senha
@@ -28,3 +28,9 @@ cat /etc/everydesk-admin.env        # para ler a nova senha
 - Variáveis (na unit): `ALLOWLIST_FILE`, `PENDING_FILE`, `BIND`.
 - Build: `cd admin && cargo zigbuild --release --target x86_64-unknown-linux-musl`; copiar `target/x86_64-unknown-linux-musl/release/everydesk-admin` para `/usr/local/bin/`.
 - hbbs precisa de `Environment=PENDING_FILE=/var/lib/rustdesk-server/pending.txt` no `override.conf` (aplicado no próximo deploy do hbbs).
+
+## Endurecimento
+
+- hbbs só grava IDs no pending se casarem com o padrão do painel (minúsculas/dígitos, 6-16), no máx. 5 IDs novos por IP e 60 no total a cada 10 min; a gravação roda fora do loop de rede. Arquivos são reescritos por temp+rename mantendo dono/permissão.
+- Sessão do painel expira em 24 h. Linhas do `allowed.txt` com ID fora do padrão aparecem sem botão Remover (edite o arquivo).
+- A unit usa `NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths=/var/lib/rustdesk-server`, `ProtectHome`, `PrivateTmp`. Segue como `User=root` porque o hbbs roda como root e é dono dos arquivos; usuário dedicado compartilhado fica como endurecimento futuro.

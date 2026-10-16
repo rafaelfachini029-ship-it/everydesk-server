@@ -375,7 +375,7 @@ impl RendezvousServer {
                     } else if !self.check_ip_blocker(&ip, &id).await {
                         return send_rk_res(socket, addr, TOO_FREQUENT).await;
                     } else if self.is_denied(&id) {
-                        crate::allowlist::record_pending(&id);
+                        crate::allowlist::record_pending(&id, addr.ip());
                         return send_rk_res_raw(socket, addr, NOT_DEPLOYED).await;
                     }
                     let peer = self.pm.get_or(&id).await;

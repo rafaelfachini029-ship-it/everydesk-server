@@ -1,5 +1,6 @@
 use hbb_common::log;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -83,19 +84,88 @@ fn update_pending(content: &str, id: &str, ts: u64, cap: usize) -> Option<String
     Some(out)
 }
 
-/// EveryDesk: remember an id denied by the allow-list in the file named by
-/// `PENDING_FILE` so the admin panel can offer it for approval. Best effort:
-/// I/O errors are logged and ignored.
-pub fn record_pending(id: &str) {
-    let path = match std::env::var("PENDING_FILE") {
-        Ok(p) if !p.is_empty() => p,
-        _ => return,
-    };
-    let id = crate::requester_auth::sanitize_id(id);
-    if id.is_empty() {
-        return;
+/// Panel-compatible id: `^[a-z0-9][a-z0-9_-]{5,15}$|^[0-9]{6,16}$`, after
+/// lowercasing. Anything else is dropped, never rewritten into another id.
+fn pending_id(id: &str) -> Option<String> {
+    let id = id.to_ascii_lowercase();
+    let b = id.as_bytes();
+    let ok = (6..=16).contains(&b.len())
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-');
+    if ok {
+        Some(id)
+    } else {
+        None
     }
-    let content = match std::fs::read_to_string(&path) {
+}
+
+const PENDING_WINDOW_SECS: u64 = 600;
+const PENDING_PER_IP: usize = 5;
+const PENDING_GLOBAL: usize = 60;
+
+/// Rate limiter for new pending ids: at most `PENDING_PER_IP` per source IP
+/// and `PENDING_GLOBAL` overall per window. Ids already accepted in the
+/// window are not accepted again (they are already queued/written).
+#[derive(Default)]
+struct PendingLimiter {
+    per_ip: HashMap<IpAddr, Vec<u64>>,
+    global: Vec<u64>,
+    seen: HashMap<String, u64>,
+}
+
+impl PendingLimiter {
+    fn allow(&mut self, id: &str, ip: IpAddr, now: u64) -> bool {
+        let fresh = |t: &u64| now.saturating_sub(*t) < PENDING_WINDOW_SECS;
+        self.global.retain(fresh);
+        self.seen.retain(|_, t| fresh(t));
+        self.per_ip.retain(|_, v| {
+            v.retain(fresh);
+            !v.is_empty()
+        });
+        if self.seen.contains_key(id) || self.global.len() >= PENDING_GLOBAL {
+            return false;
+        }
+        let v = self.per_ip.entry(ip).or_default();
+        if v.len() >= PENDING_PER_IP {
+            return false;
+        }
+        v.push(now);
+        self.global.push(now);
+        self.seen.insert(id.to_owned(), now);
+        true
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref PENDING_LIMITER: Mutex<PendingLimiter> = Mutex::new(PendingLimiter::default());
+    static ref PENDING_IO: Mutex<()> = Mutex::new(());
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Writes `content` to `path` via temp file + rename, keeping the original
+/// file's mode and owner (when we are allowed to set it).
+fn write_preserving(path: &Path, content: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp-hbbs");
+    std::fs::write(&tmp, content)?;
+    #[cfg(unix)]
+    if let Ok(m) = std::fs::metadata(path) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(m.mode() & 0o7777));
+        let _ = std::os::unix::fs::chown(&tmp, Some(m.uid()), Some(m.gid()));
+    }
+    std::fs::rename(&tmp, path)
+}
+
+fn write_pending(path: &str, id: &str, ts: u64) {
+    let _io = PENDING_IO.lock().unwrap();
+    let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
@@ -103,15 +173,32 @@ pub fn record_pending(id: &str) {
             return;
         }
     };
-    let ts = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Some(new) = update_pending(&content, &id, ts, PENDING_CAP) {
-        if let Err(e) = std::fs::write(&path, new) {
+    if let Some(new) = update_pending(&content, id, ts, PENDING_CAP) {
+        if let Err(e) = write_preserving(Path::new(path), &new) {
             log::warn!("pending: cannot write {}: {}", path, e);
         }
     }
+}
+
+/// EveryDesk: remember an id denied by the allow-list in the file named by
+/// `PENDING_FILE` so the admin panel can offer it for approval. Never blocks
+/// the caller: validation and rate limiting are in memory, file I/O runs on
+/// the blocking pool. Best effort: errors are logged and ignored.
+pub fn record_pending(id: &str, ip: IpAddr) {
+    let path = match std::env::var("PENDING_FILE") {
+        Ok(p) if !p.is_empty() => p,
+        _ => return,
+    };
+    let Some(id) = pending_id(id) else {
+        log::debug!("pending: dropped invalid id");
+        return;
+    };
+    let ts = unix_now();
+    if !PENDING_LIMITER.lock().unwrap().allow(&id, ip, ts) {
+        log::debug!("pending: rate limited {}", id);
+        return;
+    }
+    hbb_common::tokio::task::spawn_blocking(move || write_pending(&path, &id, ts));
 }
 
 #[cfg(test)]
@@ -194,5 +281,36 @@ mod tests {
         let c = update_pending(&b, "ghi789", 3, 3).unwrap();
         let d = update_pending(&c, "jkl012", 4, 3).unwrap();
         assert_eq!(d, "def456 2\nghi789 3\njkl012 4\n");
+    }
+
+    #[test]
+    fn pending_rate_limited_per_ip() {
+        let mut l = PendingLimiter::default();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        for i in 0..5 {
+            assert!(l.allow(&format!("id{}0000", i), ip, 100));
+        }
+        assert!(!l.allow("idx00000", ip, 101));
+        // another IP is fine, and the window expires
+        assert!(l.allow("idx00000", "5.6.7.8".parse().unwrap(), 101));
+        assert!(l.allow("idy00000", ip, 100 + PENDING_WINDOW_SECS));
+        // same id is not accepted twice in the window
+        assert!(!l.allow("idy00000", "9.9.9.9".parse().unwrap(), 100 + PENDING_WINDOW_SECS + 1));
+        // global cap
+        let mut g = PendingLimiter::default();
+        for i in 0..PENDING_GLOBAL {
+            let ip: IpAddr = format!("10.0.{}.{}", i / 200, i % 200).parse().unwrap();
+            assert!(g.allow(&format!("g{:06}", i), ip, 5));
+        }
+        assert!(!g.allow("late0000", "11.0.0.1".parse().unwrap(), 6));
+    }
+
+    #[test]
+    fn pending_drops_invalid_ids() {
+        assert_eq!(pending_id("ABC123").as_deref(), Some("abc123"));
+        assert_eq!(pending_id("123456789").as_deref(), Some("123456789"));
+        for bad in ["", "abc", "a b c d e f", "ab\ncdef", "-abcdef", "abc.def", "x".repeat(17).as_str(), "(:test_hbbs:)"] {
+            assert!(pending_id(bad).is_none(), "{:?}", bad);
+        }
     }
 }
