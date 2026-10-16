@@ -9,7 +9,8 @@ ssh vps-fachini 'echo <ID> >> /var/lib/rustdesk-server/allowed.txt'
 ```
 
 O arquivo precisa terminar com uma quebra de linha; variante segura: `ssh vps-fachini "printf '\n<ID>\n' >> /var/lib/rustdesk-server/allowed.txt"`.
-O ID é o número de 9 dígitos mostrado na janela do EveryDesk da máquina.
+O ID é o código memorável mostrado na janela do EveryDesk da máquina, no formato `palavra-palavra-NN` (por exemplo `vela-rio-37`).
+Escreva-o sempre em minúsculas e com hífens, exatamente como aparece: o servidor compara o texto exato (`Vela-Rio-37` ou `vela rio 37` não batem).
 Comentários com `#` são permitidos, por exemplo `<ID> # PC da Maria`, para anotar o dono da máquina.
 
 ## Listar IDs autorizados
