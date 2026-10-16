@@ -1,4 +1,4 @@
-use crate::allowlist::Allowlist;
+use crate::allowlist::{Allowlist, TEST_HBBS_ID};
 use crate::common::*;
 use crate::peer::*;
 use hbb_common::{
@@ -1340,7 +1340,7 @@ async fn test_hbbs(addr: SocketAddr) -> ResultType<()> {
     let mut socket = FramedSocket::new(config::Config::get_any_listen_addr(addr.is_ipv4())).await?;
     let mut msg_out = RendezvousMessage::new();
     msg_out.set_register_peer(RegisterPeer {
-        id: "(:test_hbbs:)".to_owned(),
+        id: TEST_HBBS_ID.to_owned(),
         ..Default::default()
     });
     let mut last_time_recv = Instant::now();

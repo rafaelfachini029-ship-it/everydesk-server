@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+/// ID of the synthetic peer hbbs registers with itself every second as a
+/// liveness self-check (`test_hbbs`); hbbs exits if it gets no answer, so the
+/// allow-list must never deny it.
+pub const TEST_HBBS_ID: &str = "(:test_hbbs:)";
+
 /// IDs allowed to use this server, read from a file with one ID per line
 /// (`#` starts a comment, surrounding whitespace is ignored). The file is
 /// re-read whenever its mtime changes; if it cannot be read, everyone is denied.
@@ -30,6 +35,9 @@ impl Allowlist {
     }
 
     pub fn is_allowed(&self, id: &str) -> bool {
+        if id == TEST_HBBS_ID {
+            return true;
+        }
         let mut cache = self.cache.lock().unwrap();
         let mtime = std::fs::metadata(&self.path)
             .and_then(|m| m.modified())
@@ -112,6 +120,14 @@ mod tests {
         std::fs::write(f.path(), "1\n2\n").unwrap();
         touch_mtime_forward(f.path());
         assert!(a.is_allowed("2"));
+    }
+
+    #[test]
+    fn internal_test_peer_is_never_denied() {
+        let f = write_tmp("");
+        let a = Allowlist::new(f.path());
+        assert!(a.is_allowed(TEST_HBBS_ID));
+        assert!(!a.is_allowed("123456789"));
     }
 
     #[test]
