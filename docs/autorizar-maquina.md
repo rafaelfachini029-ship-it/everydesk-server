@@ -20,5 +20,4 @@ ssh vps-fachini 'cat /var/lib/rustdesk-server/allowed.txt'
 ssh vps-fachini "sed -i '/^<ID>$/d' /var/lib/rustdesk-server/allowed.txt"
 ```
 
-Se a lista não recarregar sozinha, reinicie apenas o hbbs:
-`ssh vps-fachini 'systemctl restart rustdesk-hbbs'`
+A lista é relida automaticamente quando o arquivo muda (mtime); não é preciso reiniciar o hbbs.
