@@ -16,10 +16,16 @@ use std::sync::Mutex;
 
 pub const VERSION_TAG: &str = "v1";
 pub const SIGN_CONTEXT: &str = "ed-punch-v1";
-/// Maximum |now - ts|, in seconds.
-pub const MAX_SKEW_SECS: i64 = 30;
-/// How long a (my_id, ts) pair is remembered, in seconds.
-pub const REPLAY_TTL_SECS: i64 = 60;
+/// Maximum |now - ts|, in seconds (punch, relay and presence envelopes).
+pub const MAX_SKEW_SECS: i64 = 120;
+/// How long a (my_id, ts) pair is remembered, in seconds: at least twice the
+/// window, so a pair is still remembered for as long as its ts is acceptable.
+pub const REPLAY_TTL_SECS: i64 = 300;
+/// `check`'s error for a correctly signed envelope whose ts is outside the
+/// window: the only failure hbbs answers (`other_failure = "clock"`).
+pub const ERR_CLOCK: &str = "timestamp out of window";
+/// `PunchHoleResponse.other_failure` sent for `ERR_CLOCK`.
+pub const CLOCK_FAILURE: &str = "clock";
 
 pub struct Envelope {
     pub server_key: String,
@@ -123,23 +129,23 @@ pub fn relay_response_uuid(
     }
 }
 
-/// Timestamp window and signature of a punch/relay envelope; `Err` carries the
-/// reason for the log.
+/// Signature and timestamp window of a punch/relay envelope; `Err` carries the
+/// reason for the log. The signature is checked first, so `ERR_CLOCK` is only
+/// ever returned for an envelope the requester really signed.
 pub fn check(env: &Envelope, target_id: &str, pk: &[u8], now: i64) -> Result<(), &'static str> {
     check_signed(env, &signed_message(&env.my_id, target_id, env.ts), pk, now)
 }
 
 fn check_signed(env: &Envelope, msg: &str, pk: &[u8], now: i64) -> Result<(), &'static str> {
-    if now.abs_diff(env.ts) > MAX_SKEW_SECS as u64 {
-        return Err("timestamp out of window");
-    }
     let pk = sign::PublicKey::from_slice(pk).ok_or("requester has no valid pk")?;
     let sig = sign::Signature::from_bytes(&env.sig).map_err(|_| "bad signature")?;
-    if sign::verify_detached(&sig, msg.as_bytes(), &pk) {
-        Ok(())
-    } else {
-        Err("bad signature")
+    if !sign::verify_detached(&sig, msg.as_bytes(), &pk) {
+        return Err("bad signature");
     }
+    if now.abs_diff(env.ts) > MAX_SKEW_SECS as u64 {
+        return Err(ERR_CLOCK);
+    }
+    Ok(())
 }
 
 // ---- Presence (OnlineRequest on hbbs' port-1) ----
@@ -319,7 +325,7 @@ impl ReplayGuard {
         Self::default()
     }
 
-    /// True (and remembered) when the pair was not seen in the last 60 s.
+    /// True (and remembered) when the pair was not seen in the last `REPLAY_TTL_SECS`.
     pub fn check_and_insert(&self, my_id: &str, ts: i64, now: i64) -> bool {
         let mut seen = self.seen.lock().unwrap();
         seen.retain(|_, expiry| *expiry > now);
@@ -402,12 +408,35 @@ mod tests {
     #[test]
     fn expired_timestamp_fails() {
         let (pk, sk) = sign::gen_keypair();
-        let env = parse_envelope(&envelope(&sk, "111", "222", NOW - 31)).unwrap();
-        assert!(!verify(&env, "222", pk.as_ref(), NOW));
-        let env = parse_envelope(&envelope(&sk, "111", "222", NOW + 31)).unwrap();
-        assert!(!verify(&env, "222", pk.as_ref(), NOW));
-        let env = parse_envelope(&envelope(&sk, "111", "222", NOW - 30)).unwrap();
-        assert!(verify(&env, "222", pk.as_ref(), NOW));
+        let at = |ts: i64| parse_envelope(&envelope(&sk, "111", "222", ts)).unwrap();
+        // window is +-120 s, both ends inclusive
+        assert_eq!(check(&at(NOW - 121), "222", pk.as_ref(), NOW), Err(ERR_CLOCK));
+        assert_eq!(check(&at(NOW + 121), "222", pk.as_ref(), NOW), Err(ERR_CLOCK));
+        assert!(verify(&at(NOW - 120), "222", pk.as_ref(), NOW));
+        assert!(verify(&at(NOW + 120), "222", pk.as_ref(), NOW));
+        // a client 90 s off still works (the old 30 s window silently refused it)
+        assert!(verify(&at(NOW + 90), "222", pk.as_ref(), NOW));
+    }
+
+    #[test]
+    fn clock_error_only_for_genuine_signature() {
+        let (pk, sk) = sign::gen_keypair();
+        let (other_pk, _) = sign::gen_keypair();
+        let env = parse_envelope(&envelope(&sk, "111", "222", NOW - 500)).unwrap();
+        assert_eq!(check(&env, "222", pk.as_ref(), NOW), Err(ERR_CLOCK));
+        // stale *and* not signed by the requester: a bad signature, never "clock"
+        assert_eq!(check(&env, "222", other_pk.as_ref(), NOW), Err("bad signature"));
+        assert_eq!(check(&env, "333", pk.as_ref(), NOW), Err("bad signature"));
+    }
+
+    #[test]
+    fn online_window_is_120s() {
+        let (pk, sk) = sign::gen_keypair();
+        for (ts, ok) in [(NOW - 121, false), (NOW + 121, false), (NOW - 120, true), (NOW + 120, true)] {
+            assert_eq!(verify_online(&online_envelope(&sk, "111", ts), pk.as_ref(), NOW).is_some(), ok, "{ts}");
+        }
+        let env = parse_envelope(&online_envelope(&sk, "111", NOW + 121)).unwrap();
+        assert_eq!(check_online(&env, pk.as_ref(), NOW), Err(ERR_CLOCK));
     }
 
     #[test]
@@ -501,16 +530,32 @@ mod tests {
     }
 
     #[test]
-    fn replay_within_60s_fails() {
+    fn replay_within_300s_fails() {
+        assert!(REPLAY_TTL_SECS >= 2 * MAX_SKEW_SECS);
         let guard = ReplayGuard::new();
         assert!(guard.check_and_insert("111", NOW, NOW));
         assert!(!guard.check_and_insert("111", NOW, NOW + 1));
-        assert!(!guard.check_and_insert("111", NOW, NOW + 59));
+        assert!(!guard.check_and_insert("111", NOW, NOW + 119));
+        assert!(!guard.check_and_insert("111", NOW, NOW + 299));
         // other requester / other ts are independent
         assert!(guard.check_and_insert("222", NOW, NOW + 1));
         assert!(guard.check_and_insert("111", NOW + 1, NOW + 1));
-        // after the window the entry has expired (the 30 s skew check rejects it anyway)
-        assert!(guard.check_and_insert("111", NOW, NOW + 61));
+        // after the TTL the entry has expired (the 120 s skew check rejects it anyway)
+        assert!(guard.check_and_insert("111", NOW, NOW + 300));
+    }
+
+    #[test]
+    fn replay_inside_window_rejected_by_gate() {
+        // a genuine presence envelope accepted at its ts is refused when replayed
+        // anywhere inside its +-120 s validity (and per-id interval has passed)
+        let gate = OnlineGate::new();
+        let (pk, sk) = sign::gen_keypair();
+        let env = online_envelope(&sk, "111", NOW);
+        assert!(admit(&gate, &env, 1, "6.6.6.1", &pk, NOW - 100).is_ok());
+        assert!(matches!(
+            admit(&gate, &env, 1, "6.6.6.2", &pk, NOW + 120),
+            Err(OnlineDenial::Denied("replay"))
+        ));
     }
 
     fn online_envelope(sk: &sign::SecretKey, my_id: &str, ts: i64) -> String {
@@ -541,7 +586,7 @@ mod tests {
         let (pk, sk) = sign::gen_keypair();
         let env = online_envelope(&sk, "111", NOW);
         assert_eq!(verify_online(&env, pk.as_ref(), NOW + 3).as_deref(), Some("111"));
-        assert!(verify_online(&env, pk.as_ref(), NOW + 31).is_none());
+        assert!(verify_online(&env, pk.as_ref(), NOW + 121).is_none());
         // a punch envelope (any target) is not an online envelope
         let punch = envelope(&sk, "111", "", NOW);
         assert!(verify_online(&punch, pk.as_ref(), NOW).is_none());
@@ -699,5 +744,34 @@ mod tests {
         assert!(!key.verify_uuid("7c9e6679-7425-40de-944b-e07fc1f90ae7"));
         assert!(!key.verify_uuid("7c9e6679-7425-40de-944b-e07fc1f90ae7.AAAA"));
         assert!(!RelayKey::from_secret("other").verify_uuid(&uuid));
+    }
+
+    /// Known-answer vector, also in docs/protocolo-everydesk-vector.md: the
+    /// client must produce exactly these envelopes from this seed.
+    const KAT_SEED_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const KAT_PK_B64: &str = "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=";
+    const KAT_TS: i64 = 1_800_000_000;
+    const KAT_PUNCH: &str = "SRVKEY;v1;123456789;1800000000;YJ7AacQGlO9/sFaHhtKSUDdjP5YQrSTDP9k9T7RPIQhAFTsqNfnlwMO1ifWwcnJuUxWEakavEgRpQtYhzbrNBA==";
+    const KAT_ONLINE: &str = "SRVKEY;v1;123456789;1800000000;K4o10Ltj36N69t9EPu7drFemTzQtDvuqvoQ1ijCniecHoVbOiG2HWH+u06GbF0EqIkIgNSy+BhA8Wi69QS/6Ag==";
+
+    #[test]
+    fn known_answer_vector() {
+        let seed: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&KAT_SEED_HEX[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        let (pk, sk) = sign::keypair_from_seed(&sign::Seed::from_slice(&seed).unwrap());
+        assert_eq!(base64::encode(pk.as_ref()), KAT_PK_B64);
+        assert_eq!(signed_message("123456789", "987654321", KAT_TS), "ed-punch-v1|123456789|987654321|1800000000");
+        assert_eq!(online_message("123456789", KAT_TS), "ed-online-v1|123456789|1800000000");
+        // ed25519 is deterministic: the same seed yields the same envelope
+        assert_eq!(envelope(&sk, "123456789", "987654321", KAT_TS), KAT_PUNCH);
+        assert_eq!(online_envelope(&sk, "123456789", KAT_TS), KAT_ONLINE);
+        let pk = base64::decode(KAT_PK_B64).unwrap();
+        let env = parse_envelope(KAT_PUNCH).unwrap();
+        assert_eq!((env.server_key.as_str(), env.my_id.as_str(), env.ts), ("SRVKEY", "123456789", KAT_TS));
+        assert_eq!(check(&env, "987654321", &pk, KAT_TS + 120), Ok(()));
+        assert_eq!(check(&env, "987654321", &pk, KAT_TS + 121), Err(ERR_CLOCK));
+        assert_eq!(check(&env, "987654322", &pk, KAT_TS), Err("bad signature"));
+        assert_eq!(verify_online(KAT_ONLINE, &pk, KAT_TS - 120).as_deref(), Some("123456789"));
     }
 }

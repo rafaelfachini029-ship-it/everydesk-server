@@ -503,18 +503,25 @@ impl RendezvousServer {
     fn is_denied(&self, id: &str) -> bool {
         match &self.allowlist {
             Some(a) if !a.is_allowed(id) => {
-                log::info!("allowlist: denied {}", id);
+                // `id` comes from unauthenticated packets: sanitize before logging
+                log::info!("allowlist: denied {}", requester_auth::sanitize_id(id));
                 true
             }
             _ => false,
         }
     }
 
-    /// EveryDesk: true when the requester's signed envelope in `licence_key`
-    /// does not authorize a punch/relay to `target_id` (see `requester_auth`).
-    async fn requester_denied(&self, licence_key: &str, target_id: &str, key: &str) -> bool {
+    /// EveryDesk: `Some(reason)` when the requester's signed envelope in
+    /// `licence_key` does not authorize a punch/relay to `target_id` (see
+    /// `requester_auth`); `None` when it does.
+    async fn requester_denied(
+        &self,
+        licence_key: &str,
+        target_id: &str,
+        key: &str,
+    ) -> Option<&'static str> {
         let (my_id, reason) = match self.check_requester(licence_key, target_id, key).await {
-            Ok(()) => return false,
+            Ok(()) => return None,
             Err(e) => e,
         };
         log::info!(
@@ -523,7 +530,7 @@ impl RendezvousServer {
             requester_auth::sanitize_id(target_id),
             reason
         );
-        true
+        Some(reason)
     }
 
     async fn check_requester(
@@ -586,9 +593,20 @@ impl RendezvousServer {
                         Self::send_to_sink(sink, msg_out).await;
                         return true;
                     }
-                    let authenticated =
-                        !self.requester_denied(&ph.licence_key, &ph.id, key).await;
-                    if !requester_auth::sink_insert_allowed(key, &ph.licence_key, authenticated) {
+                    let denied = self.requester_denied(&ph.licence_key, &ph.id, key).await;
+                    if denied == Some(requester_auth::ERR_CLOCK) {
+                        // Genuinely signed but the requester's clock is off by more than
+                        // the window: tell it so on this connection (never via tcp_punch)
+                        // instead of dropping silently. Bad signatures stay silent.
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_punch_hole_response(PunchHoleResponse {
+                            other_failure: requester_auth::CLOCK_FAILURE.to_owned(),
+                            ..Default::default()
+                        });
+                        Self::send_to_sink(sink, msg_out).await;
+                        return true;
+                    }
+                    if !requester_auth::sink_insert_allowed(key, &ph.licence_key, denied.is_none()) {
                         return false;
                     }
                     self.authed
@@ -605,7 +623,7 @@ impl RendezvousServer {
                         return false;
                     }
                     let authenticated =
-                        !self.requester_denied(&rf.licence_key, &rf.id, key).await;
+                        self.requester_denied(&rf.licence_key, &rf.id, key).await.is_none();
                     if !requester_auth::sink_insert_allowed(key, &rf.licence_key, authenticated) {
                         return false;
                     }
@@ -925,7 +943,8 @@ impl RendezvousServer {
 
     /// EveryDesk: `OnlineRequest.id` must be a presence envelope (see
     /// `requester_auth::OnlineGate`) from an allow-listed, registered requester;
-    /// at most 200 peers; one request per 5 s per id and per source IP.
+    /// at most 200 peers; one request per 5 s per id and `ONLINE_IP_BUDGET` (10)
+    /// per 5 s per source IP.
     async fn online_admitted(
         &self,
         id_field: &str,

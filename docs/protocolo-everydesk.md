@@ -31,12 +31,28 @@ Para `PunchHoleRequest` e `RequestRelay`, em ordem:
 3. primeira parte = chave do servidor. Em `PunchHoleRequest` uma chave errada mantém a resposta upstream `LICENSE_MISMATCH`, enviada direto na própria conexão (o socket **nunca** entra em `tcp_punch`); em `RequestRelay` nega;
 4. `my_id` na allow-list;
 5. `pm.get(my_id).pk` existe e verifica a assinatura sobre `ed-punch-v1|my_id|id|ts`;
-6. `|agora − ts| ≤ 30 s`;
-7. o par `(my_id, ts)` não foi aceito nos últimos 60 s (anti-replay em memória). O cliente garante `ts` estritamente crescente por processo.
+6. `|agora − ts| ≤ 120 s` (ambos os extremos aceitos; vale também para presença). A
+   janela é larga de propósito: um relógio de cliente uns 30–60 s fora (comum em PC
+   sem NTP) não pode desligar a máquina em silêncio;
+7. o par `(my_id, ts)` não foi aceito nos últimos 300 s (anti-replay em memória,
+   TTL ≥ 2× a janela, então um envelope nunca sai do anti-replay enquanto o `ts`
+   ainda é aceito). O cliente garante `ts` estritamente crescente por processo.
 
-Falha: a conexão TCP é fechada sem resposta e o hbbs loga
-`auth: denied <my_id> -> <target_id> (<motivo>)`. O envelope é removido do
-`RequestRelay` antes de repassá-lo ao alvo.
+A assinatura (5) é verificada **antes** da janela (6), então o erro de relógio só
+existe para um envelope que o próprio `my_id` assinou.
+
+Falha: o hbbs loga `auth: denied <my_id> -> <target_id> (<motivo>)` e
+
+- relógio fora da janela (assinatura válida) em `PunchHoleRequest`: responde na
+  própria conexão `PunchHoleResponse { other_failure: "clock" }` (o socket não
+  entra em `tcp_punch`). O cliente deve mostrar algo como "relógio deste computador
+  está errado — acerte data/hora" em vez de "offline";
+- qualquer outra falha (assinatura ruim, sem envelope, fora da allow-list, replay)
+  e toda falha em `RequestRelay`: conexão fechada sem resposta.
+
+O envelope é removido do `RequestRelay` antes de repassá-lo ao alvo.
+
+Vetor de teste conhecido (seed fixa → envelope esperado): `docs/protocolo-everydesk-vector.md`.
 
 ## UUID de relay com HMAC (`RELAY_SECRET`)
 
@@ -68,9 +84,15 @@ só roda com token/switch code ou WebRTC). Quem estiver no caminho (on-path) con
   relay continua carregando a sessão cifrada ponta a ponta do RustDesk (chaves
   assinadas pelo servidor), então isso dá no máximo negação de serviço ou uso de
   banda, não acesso à sessão;
-- reenviar o envelope para o **mesmo** alvo dentro de 30 s, se o original não chegou
+- reenviar o envelope para o **mesmo** alvo dentro de 120 s, se o original não chegou
   ao hbbs (o anti-replay só bloqueia o que já foi visto);
 - descartar ou atrasar mensagens (negação de serviço).
+
+Também resta, igual ao upstream e sem precisar estar no caminho: qualquer um pode
+mandar ao hbbs um `RelayResponse` forjado com `socket_addr` de um solicitante que
+tem conexão aberta, e o hbbs o entrega por `tcp_punch` (com tag se o solicitante
+autenticou nos últimos 60 s). Isso só atrapalha aquela tentativa de conexão (DoS),
+porque o par no hbbr ainda exige o outro lado e a sessão continua cifrada ponta a ponta.
 
 Não consegue forjar envelope para outro alvo ou outro ID (a assinatura amarra
 `my_id`, alvo e ts), nem obter tag de relay sem antes autenticar.
@@ -91,11 +113,13 @@ próprio: uma assinatura de punch não vale para presença e vice-versa). O hbbs
 1. no máximo 10 pedidos a cada 5 s por IP de origem (todo pedido conta, válido ou não). A cota é por IP e não 1 porque várias máquinas atrás do mesmo NAT (casa, escritório) compartilham o IP; com mais de ~10 EveryDesk sondando atrás de um NAT, alguns pedidos ficam sem resposta e o app mantém o último estado conhecido;
 2. `peers.len() ≤ 200`;
 3. envelope `v1` com a chave do servidor;
-4. `my_id` na allow-list e com `pk` registrado; assinatura e janela de ±30 s;
-5. anti-replay `(my_id, ts)` por 60 s (separado do de punch);
+4. `my_id` na allow-list e com `pk` registrado; assinatura e janela de ±120 s;
+5. anti-replay `(my_id, ts)` por 300 s (separado do de punch);
 6. no máximo 1 pedido a cada 5 s por `my_id` (só pedidos autenticados contam, então
    um forjador não consome a cota de outro ID).
 
-Falha: conexão fechada sem resposta; log `online: denied <my_id> (<motivo>)` ou
+Falha: conexão fechada sem resposta (inclusive relógio fora da janela: o
+`OnlineResponse` não tem campo de erro; o cliente descobre o problema de relógio no
+próximo punch); log `online: denied <my_id> (<motivo>)` ou
 `online: rate limited <my_id|ip>`. A resposta para quem passa é a mesma de upstream.
 Clientes RustDesk comuns deixam de ver presença por este servidor.
