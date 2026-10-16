@@ -356,14 +356,13 @@ impl RendezvousServer {
                         return Ok(());
                     }
                     let id = rk.id;
-                    if self.is_denied(&id) {
-                        return send_rk_res(socket, addr, NOT_SUPPORT).await;
-                    }
                     let ip = addr.ip().to_string();
                     if id.len() < 6 {
                         return send_rk_res(socket, addr, UUID_MISMATCH).await;
                     } else if !self.check_ip_blocker(&ip, &id).await {
                         return send_rk_res(socket, addr, TOO_FREQUENT).await;
+                    } else if self.is_denied(&id) {
+                        return send_rk_res(socket, addr, NOT_SUPPORT).await;
                     }
                     let peer = self.pm.get_or(&id).await;
                     let (changed, ip_changed) = {
@@ -521,6 +520,10 @@ impl RendezvousServer {
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
                     if self.is_denied(&rf.id) {
+                        return false;
+                    }
+                    if !key.is_empty() && rf.licence_key != key {
+                        log::info!("allowlist: relay denied, key mismatch");
                         return false;
                     }
                     // there maybe several attempt, so sink can be none
