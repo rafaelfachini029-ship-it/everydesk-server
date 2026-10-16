@@ -62,6 +62,58 @@ fn parse(content: &str) -> HashSet<String> {
         .collect()
 }
 
+const PENDING_CAP: usize = 500;
+
+/// Pure update of the pending list: `None` when `id` is already present
+/// (dedupe), otherwise the new content with `"<id> <ts>\n"` appended and the
+/// oldest lines dropped beyond `cap`.
+fn update_pending(content: &str, id: &str, ts: u64, cap: usize) -> Option<String> {
+    let mut lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines
+        .iter()
+        .any(|l| l.split_whitespace().next() == Some(id))
+    {
+        return None;
+    }
+    let new_line = format!("{} {}", id, ts);
+    lines.push(&new_line);
+    let start = lines.len().saturating_sub(cap);
+    let mut out = lines[start..].join("\n");
+    out.push('\n');
+    Some(out)
+}
+
+/// EveryDesk: remember an id denied by the allow-list in the file named by
+/// `PENDING_FILE` so the admin panel can offer it for approval. Best effort:
+/// I/O errors are logged and ignored.
+pub fn record_pending(id: &str) {
+    let path = match std::env::var("PENDING_FILE") {
+        Ok(p) if !p.is_empty() => p,
+        _ => return,
+    };
+    let id = crate::requester_auth::sanitize_id(id);
+    if id.is_empty() {
+        return;
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            log::warn!("pending: cannot read {}: {}", path, e);
+            return;
+        }
+    };
+    let ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(new) = update_pending(&content, &id, ts, PENDING_CAP) {
+        if let Err(e) = std::fs::write(&path, new) {
+            log::warn!("pending: cannot write {}: {}", path, e);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +183,16 @@ mod tests {
     fn missing_file_denies_everyone() {
         let a = Allowlist::new(std::path::Path::new("/nonexistent/x.txt"));
         assert!(!a.is_allowed("1"));
+    }
+
+    #[test]
+    fn pending_dedupes_and_caps() {
+        let a = update_pending("", "abc123", 1, 3).unwrap();
+        assert_eq!(a, "abc123 1\n");
+        assert!(update_pending(&a, "abc123", 2, 3).is_none());
+        let b = update_pending(&a, "def456", 2, 3).unwrap();
+        let c = update_pending(&b, "ghi789", 3, 3).unwrap();
+        let d = update_pending(&c, "jkl012", 4, 3).unwrap();
+        assert_eq!(d, "def456 2\nghi789 3\njkl012 4\n");
     }
 }

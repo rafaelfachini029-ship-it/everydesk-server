@@ -1,0 +1,23 @@
+[package]
+name = "everydesk-admin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde = { version = "1", features = ["derive"] }
+rand = "0.8"
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+
+# Standalone crate (not part of the hbbs workspace); own Cargo.lock.
+[workspace]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "s"
