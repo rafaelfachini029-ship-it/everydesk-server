@@ -1,7 +1,7 @@
 use crate::allowlist::{Allowlist, TEST_HBBS_ID};
 use crate::common::*;
 use crate::peer::*;
-use crate::requester_auth::{self, RelayKey, ReplayGuard};
+use crate::requester_auth::{self, AuthedRequesters, RelayKey, ReplayGuard};
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -92,6 +92,7 @@ pub struct RendezvousServer {
     inner: Arc<Inner>,
     allowlist: Option<Arc<Allowlist>>,
     replay: Arc<ReplayGuard>,
+    authed: Arc<AuthedRequesters>,
     relay_key: Option<Arc<RelayKey>>,
 }
 
@@ -149,6 +150,7 @@ impl RendezvousServer {
             }),
             allowlist: Allowlist::from_env().map(Arc::new),
             replay: Arc::new(ReplayGuard::new()),
+            authed: Arc::new(AuthedRequesters::new()),
             relay_key: RelayKey::from_env().map(Arc::new),
         };
         log::info!("mask: {:?}", rs.inner.mask);
@@ -512,7 +514,12 @@ impl RendezvousServer {
             Ok(()) => return false,
             Err(e) => e,
         };
-        log::info!("auth: denied {} -> {} ({})", my_id, target_id, reason);
+        log::info!(
+            "auth: denied {} -> {} ({})",
+            requester_auth::sanitize_id(&my_id),
+            requester_auth::sanitize_id(target_id),
+            reason
+        );
         true
     }
 
@@ -560,13 +567,29 @@ impl RendezvousServer {
                     if self.is_denied(&ph.id) {
                         return false;
                     }
-                    // A wrong server key keeps its upstream answer (LICENSE_MISMATCH,
-                    // from handle_punch_hole_request); anything else must authenticate.
-                    let key_matches = key.is_empty()
-                        || requester_auth::server_key_part(&ph.licence_key) == key;
-                    if key_matches && self.requester_denied(&ph.licence_key, &ph.id, key).await {
+                    // A wrong server key keeps its upstream answer, LICENSE_MISMATCH, but
+                    // sent straight on this connection's sink: it never enters tcp_punch.
+                    if !requester_auth::server_key_matches(key, &ph.licence_key) {
+                        log::warn!(
+                            "Authentication failed from {} for peer {} - invalid key",
+                            addr,
+                            requester_auth::sanitize_id(&ph.id)
+                        );
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_punch_hole_response(PunchHoleResponse {
+                            failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                            ..Default::default()
+                        });
+                        Self::send_to_sink(sink, msg_out).await;
+                        return true;
+                    }
+                    let authenticated =
+                        !self.requester_denied(&ph.licence_key, &ph.id, key).await;
+                    if !requester_auth::sink_insert_allowed(key, &ph.licence_key, authenticated) {
                         return false;
                     }
+                    self.authed
+                        .authorize(try_into_v4(addr), requester_auth::now_secs());
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
@@ -578,9 +601,13 @@ impl RendezvousServer {
                     if self.is_denied(&rf.id) {
                         return false;
                     }
-                    if self.requester_denied(&rf.licence_key, &rf.id, key).await {
+                    let authenticated =
+                        !self.requester_denied(&rf.licence_key, &rf.id, key).await;
+                    if !requester_auth::sink_insert_allowed(key, &rf.licence_key, authenticated) {
                         return false;
                     }
+                    self.authed
+                        .authorize(try_into_v4(addr), requester_auth::now_secs());
                     // the envelope is for hbbs only
                     rf.licence_key = Default::default();
                     if let Some(k) = &self.relay_key {
@@ -604,13 +631,17 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
                     rr.socket_addr = Default::default();
-                    // Only reaches addr_b if it is a requester socket that authenticated
-                    // (tcp_punch holds only those), so the tag is never handed to strangers.
-                    if let Some(k) = &self.relay_key {
-                        if !rr.uuid.is_empty() {
-                            rr.uuid = k.sign_uuid(&rr.uuid);
-                        }
-                    }
+                    // The sender of a RelayResponse is not authenticated, so the uuid is
+                    // tagged only when addressed to a requester socket that authenticated
+                    // in the last 60 s; tcp_punch, the only way to reach addr_b, holds
+                    // only those sinks too.
+                    rr.uuid = requester_auth::relay_response_uuid(
+                        self.relay_key.as_deref(),
+                        &self.authed,
+                        try_into_v4(addr_b),
+                        &rr.uuid,
+                        requester_auth::now_secs(),
+                    );
                     let id = rr.id();
                     if !id.is_empty() {
                         let pk = self.get_pk(&rr.version, id.to_owned()).await;
@@ -784,7 +815,11 @@ impl RendezvousServer {
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
         if !key.is_empty() && requester_auth::server_key_part(&ph.licence_key) != key {
-            log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
+            log::warn!(
+                "Authentication failed from {} for peer {} - invalid key",
+                addr,
+                requester_auth::sanitize_id(&ph.id)
+            );
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),

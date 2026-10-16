@@ -28,7 +28,7 @@ Para `PunchHoleRequest` e `RequestRelay`, em ordem:
 
 1. alvo (`id`) na allow-list (como antes);
 2. `licence_key` tem 5 partes separadas por `;` e a segunda é `v1` — senão nega;
-3. primeira parte = chave do servidor. Em `PunchHoleRequest` uma chave errada mantém a resposta upstream `LICENSE_MISMATCH`; em `RequestRelay` nega;
+3. primeira parte = chave do servidor. Em `PunchHoleRequest` uma chave errada mantém a resposta upstream `LICENSE_MISMATCH`, enviada direto na própria conexão (o socket **nunca** entra em `tcp_punch`); em `RequestRelay` nega;
 4. `my_id` na allow-list;
 5. `pm.get(my_id).pk` existe e verifica a assinatura sobre `ed-punch-v1|my_id|id|ts`;
 6. `|agora − ts| ≤ 30 s`;
@@ -45,7 +45,9 @@ Com a variável de ambiente `RELAY_SECRET` definida (mesmo valor no hbbs e no hb
 - o hbbs reescreve o uuid de relay como `<base>.<tag>`, com
   `tag = base64url_sem_padding(HMAC-SHA256(SHA256(RELAY_SECRET), base))`:
   no `RequestRelay` repassado ao alvo e no `RelayResponse` repassado ao solicitante
-  (este só chega a sockets que já passaram na autenticação acima);
+  — este só recebe tag se o destino (`socket_addr`) for um socket de solicitante
+  que autenticou nos últimos 60 s; caso contrário o uuid passa sem tag. Só sockets
+  autenticados entram em `tcp_punch`, que é o único caminho até o solicitante;
 - o hbbr emparelha os dois sockets pela `base` e só emparelha se ao menos um deles
   apresentou um uuid com tag válida (o outro lado usa o uuid sem tag que ele mesmo
   gerou). Uuid com `.` e tag inválida é recusado na hora
@@ -55,3 +57,20 @@ Sem `RELAY_SECRET` (ou vazio) os dois se comportam como upstream. O hbbr sempre
 emparelha pela parte antes do primeiro `.`; uuids upstream não têm `.`, então
 hbbs com segredo + hbbr sem segredo continua funcionando (sem a proteção). O
 contrário (hbbr com segredo, hbbs sem) quebra todo relay — configurar os dois juntos.
+
+## Risco residual: canal hbbs em texto claro
+
+A conexão TCP cliente↔hbbs (porta 21116) não é cifrada neste fluxo (o `secure_tcp`
+só roda com token/switch code ou WebRTC). Quem estiver no caminho (on-path) consegue:
+
+- ler o envelope e o uuid com tag enquanto trafegam, e usar o uuid com tag para se
+  emparelhar no hbbr antes do lado legítimo (dentro da janela de 30 s do hbbr). O
+  relay continua carregando a sessão cifrada ponta a ponta do RustDesk (chaves
+  assinadas pelo servidor), então isso dá no máximo negação de serviço ou uso de
+  banda, não acesso à sessão;
+- reenviar o envelope para o **mesmo** alvo dentro de 30 s, se o original não chegou
+  ao hbbs (o anti-replay só bloqueia o que já foi visto);
+- descartar ou atrasar mensagens (negação de serviço).
+
+Não consegue forjar envelope para outro alvo ou outro ID (a assinatura amarra
+`my_id`, alvo e ts), nem obter tag de relay sem antes autenticar.

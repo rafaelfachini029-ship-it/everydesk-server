@@ -11,6 +11,7 @@
 
 use sodiumoxide::crypto::{auth::hmacsha256, hash::sha256, sign};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Mutex;
 
 pub const VERSION_TAG: &str = "v1";
@@ -61,9 +62,70 @@ pub fn server_key_part(licence_key: &str) -> &str {
     }
 }
 
+/// True when the key part of `licence_key` is the server's key (or the server has none).
+pub fn server_key_matches(key: &str, licence_key: &str) -> bool {
+    key.is_empty() || server_key_part(licence_key) == key
+}
+
+/// The single gate for putting a requester's sink into hbbs' `tcp_punch`: only a
+/// request with the right server key whose envelope authenticated. Anything that
+/// reaches `tcp_punch` can receive a tagged relay uuid, so nothing else may.
+pub fn sink_insert_allowed(key: &str, licence_key: &str, authenticated: bool) -> bool {
+    server_key_matches(key, licence_key) && authenticated
+}
+
+/// Attacker-controlled ids for the log: `[A-Za-z0-9_-]` only, at most 32 chars.
+pub fn sanitize_id(id: &str) -> String {
+    id.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(32)
+        .collect()
+}
+
+/// Requester sockets that authenticated in the last `AUTHED_TTL_SECS`. A relay
+/// uuid from a `RelayResponse` is tagged only when it is addressed to one of them.
+pub const AUTHED_TTL_SECS: i64 = 60;
+
+#[derive(Default)]
+pub struct AuthedRequesters {
+    map: Mutex<HashMap<SocketAddr, i64>>,
+}
+
+impl AuthedRequesters {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn authorize(&self, addr: SocketAddr, now: i64) {
+        let mut map = self.map.lock().unwrap();
+        map.retain(|_, expiry| *expiry > now);
+        map.insert(addr, now + AUTHED_TTL_SECS);
+    }
+
+    pub fn is_authorized(&self, addr: SocketAddr, now: i64) -> bool {
+        matches!(self.map.lock().unwrap().get(&addr), Some(expiry) if *expiry > now)
+    }
+}
+
+/// The uuid hbbs forwards in a `RelayResponse` to `addr_b`: tagged only when a
+/// relay key is set and `addr_b` is an authenticated requester; otherwise unchanged
+/// (an untagged or forged-tag uuid pairs with nothing in hbbr when the secret is set).
+pub fn relay_response_uuid(
+    key: Option<&RelayKey>,
+    authed: &AuthedRequesters,
+    addr_b: SocketAddr,
+    uuid: &str,
+    now: i64,
+) -> String {
+    match key {
+        Some(k) if !uuid.is_empty() && authed.is_authorized(addr_b, now) => k.sign_uuid(uuid),
+        _ => uuid.to_owned(),
+    }
+}
+
 /// Timestamp window and signature; `Err` carries the reason for the log.
 pub fn check(env: &Envelope, target_id: &str, pk: &[u8], now: i64) -> Result<(), &'static str> {
-    if (now - env.ts).abs() > MAX_SKEW_SECS {
+    if now.abs_diff(env.ts) > MAX_SKEW_SECS as u64 {
         return Err("timestamp out of window");
     }
     let pk = sign::PublicKey::from_slice(pk).ok_or("requester has no valid pk")?;
@@ -207,6 +269,67 @@ mod tests {
         // garbage pk
         let env = parse_envelope(&envelope(&sk, "111", "222", NOW)).unwrap();
         assert!(!verify(&env, "222", b"short", NOW));
+    }
+
+    #[test]
+    fn extreme_timestamp_does_not_panic() {
+        let (pk, sk) = sign::gen_keypair();
+        for ts in [i64::MIN, i64::MAX, i64::MIN + 1] {
+            let env = parse_envelope(&envelope(&sk, "111", "222", ts)).unwrap();
+            assert!(!verify(&env, "222", pk.as_ref(), NOW));
+            // far ends of the range must not overflow either
+            let _ = verify(&env, "222", pk.as_ref(), i64::MIN);
+            let _ = verify(&env, "222", pk.as_ref(), i64::MAX);
+        }
+    }
+
+    #[test]
+    fn key_mismatch_does_not_insert_sink() {
+        let (_, sk) = sign::gen_keypair();
+        let env = envelope(&sk, "111", "222", NOW);
+        // wrong server key: never inserted, even if authentication were to succeed
+        assert!(!sink_insert_allowed("OTHERKEY", &env, true));
+        assert!(!sink_insert_allowed("OTHERKEY", "OTHERKEYX", true));
+        // right key but not authenticated
+        assert!(!sink_insert_allowed("SRVKEY", &env, false));
+        // stock client with the right plain key: still needs authentication
+        assert!(!sink_insert_allowed("SRVKEY", "SRVKEY", false));
+        assert!(sink_insert_allowed("SRVKEY", &env, true));
+        assert!(sink_insert_allowed("", &env, true));
+    }
+
+    #[test]
+    fn relay_response_cannot_tag_unissued_uuid() {
+        let key = RelayKey::from_secret("s3cret");
+        let authed = AuthedRequesters::new();
+        let a: SocketAddr = "1.2.3.4:5000".parse().unwrap();
+        let b: SocketAddr = "5.6.7.8:6000".parse().unwrap();
+        let uuid = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+        // nobody authenticated: passes through untagged
+        let out = relay_response_uuid(Some(&key), &authed, a, uuid, NOW);
+        assert_eq!(out, uuid);
+        assert!(!key.verify_uuid(&out));
+        authed.authorize(a, NOW);
+        // to the authenticated requester: tagged
+        let out = relay_response_uuid(Some(&key), &authed, a, uuid, NOW + 1);
+        assert!(key.verify_uuid(&out));
+        // to another socket: untagged
+        assert_eq!(relay_response_uuid(Some(&key), &authed, b, uuid, NOW + 1), uuid);
+        // after the window: untagged
+        assert_eq!(
+            relay_response_uuid(Some(&key), &authed, a, uuid, NOW + AUTHED_TTL_SECS),
+            uuid
+        );
+        // no secret: upstream behaviour
+        authed.authorize(a, NOW);
+        assert_eq!(relay_response_uuid(None, &authed, a, uuid, NOW), uuid);
+    }
+
+    #[test]
+    fn sanitize_id_limits_log_input() {
+        assert_eq!(sanitize_id("abc-DEF_123"), "abc-DEF_123");
+        assert_eq!(sanitize_id("a\nb;c\x1b[31m"), "abc31m");
+        assert_eq!(sanitize_id(&"x".repeat(100)).len(), 32);
     }
 
     #[test]
