@@ -53,6 +53,7 @@ pub fn router(state: St) -> Router {
     Router::new()
         .route("/login", get(login_page).post(login))
         .route("/", get(index))
+        .route("/approve", post(approve_manual))
         .route("/approve/:id", post(approve))
         .route("/block/:id", post(block))
         .route("/remove/:id", post(remove))
@@ -331,6 +332,29 @@ fn btn(action: &str, id: &str, csrf: &str, label: &str, class: &str) -> String {
     )
 }
 
+#[derive(Debug, PartialEq)]
+struct PendingEntry {
+    id: String,
+    ts: u64,
+    /// Source IP hbbs recorded; absent in the older `"<id> <ts>"` lines.
+    ip: Option<IpAddr>,
+}
+
+/// Lines `"<id> <ts>"` (old) or `"<id> <ts> <ip>"`; invalid ids and malformed
+/// lines are skipped, an unparsable ip is shown as absent.
+fn parse_pending(content: &str) -> Vec<PendingEntry> {
+    content
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let id = it.next()?;
+            let ts = it.next()?.parse().ok()?;
+            let ip = it.next().and_then(|s| s.parse().ok());
+            valid_id(id).then(|| PendingEntry { id: id.to_string(), ts, ip })
+        })
+        .collect()
+}
+
 async fn index(State(st): State<St>, headers: HeaderMap) -> Response {
     let Some((_, csrf)) = session_of(&st, &headers) else {
         return Redirect::to("/login").into_response();
@@ -341,33 +365,38 @@ async fn index(State(st): State<St>, headers: HeaderMap) -> Response {
     let pending = read(&st.pending);
     let mut b = String::from("<h1>EveryDesk - Máquinas</h1>");
 
+    b.push_str(&format!(
+        "<h2>Aprovar ID</h2><form method=\"post\" action=\"/approve\" style=\"display:block\">\
+<input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+<input type=\"text\" name=\"id\" placeholder=\"ID da máquina (ex.: 123456789)\" \
+autocomplete=\"off\" required maxlength=\"16\">\
+<button type=\"submit\">Aprovar ID</button></form>",
+        esc(&csrf)
+    ));
+
     b.push_str("<h2>Pendentes</h2>");
     let mut rows = String::new();
-    let mut pend: Vec<(String, u64)> = pending
-        .lines()
-        .filter_map(|l| {
-            let mut it = l.split_whitespace();
-            let id = it.next()?;
-            let ts = it.next()?.parse().ok()?;
-            Some((id.to_string(), ts))
-        })
-        .filter(|(id, _)| valid_id(id) && !contains_id(&allow, id) && !contains_id(&blocked, id))
+    let mut pend: Vec<PendingEntry> = parse_pending(&pending)
+        .into_iter()
+        .filter(|p| !contains_id(&allow, &p.id) && !contains_id(&blocked, &p.id))
         .collect();
     pend.reverse();
-    for (id, ts) in &pend {
+    for p in &pend {
+        let ip = p.ip.map(|ip| ip.to_string()).unwrap_or_else(|| "-".into());
         rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}{}</td></tr>",
-            esc(id),
-            fmt_ts(*ts),
-            btn("approve", id, &csrf, "Aprovar", ""),
-            btn("block", id, &csrf, "Bloquear", "red")
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}{}</td></tr>",
+            esc(&p.id),
+            fmt_ts(p.ts),
+            esc(&ip),
+            btn("approve", &p.id, &csrf, "Aprovar", ""),
+            btn("block", &p.id, &csrf, "Bloquear", "red")
         ));
     }
     if rows.is_empty() {
         b.push_str("<p class=\"empty\">Nenhuma máquina pendente.</p>");
     } else {
         b.push_str(&format!(
-            "<table><tr><th>ID</th><th>Quando</th><th></th></tr>{}</table>",
+            "<table><tr><th>ID</th><th>Quando</th><th>Origem (IP)</th><th></th></tr>{}</table>",
             rows
         ));
     }
@@ -499,6 +528,22 @@ async fn approve(
     act(&st, &headers, &id, &f.csrf, Act::Approve)
 }
 
+#[derive(Deserialize)]
+struct ManualForm {
+    csrf: String,
+    id: String,
+}
+
+/// "Aprovar ID": same session, CSRF and id checks as the per-row buttons, for
+/// an id that never showed up in the pending list.
+async fn approve_manual(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Form(f): Form<ManualForm>,
+) -> Response {
+    act(&st, &headers, f.id.trim(), &f.csrf, Act::Approve)
+}
+
 async fn block(
     State(st): State<St>,
     headers: HeaderMap,
@@ -609,6 +654,84 @@ mod tests {
             assert_eq!(s, StatusCode::BAD_REQUEST, "{}", id);
         }
         assert_eq!(read(&allow), "# amigos\n111111 # Joao\n222222\n");
+    }
+
+    async fn post_body(st: &St, uri: &str, cookie: &str, body: &str) -> StatusCode {
+        router(st.clone())
+            .oneshot(
+                Request::post(uri)
+                    .header("cookie", cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn manual_approve_form() {
+        let (st, allow, _) = setup("manual");
+        // not logged in
+        assert_eq!(
+            post_body(&st, "/approve", "", "csrf=x&id=987654321").await,
+            StatusCode::UNAUTHORIZED
+        );
+        let (cookie, csrf) = login_ok(&st).await;
+        // wrong csrf
+        assert_eq!(
+            post_body(&st, "/approve", &cookie, "csrf=bad&id=987654321").await,
+            StatusCode::FORBIDDEN
+        );
+        // invalid ids
+        for id in ["ab", "ABCDEF", "a%0Ab%20cdef", "12345", "-abcdef", "a%23b%20cdef"] {
+            let body = format!("csrf={}&id={}", csrf, id);
+            assert_eq!(post_body(&st, "/approve", &cookie, &body).await, StatusCode::BAD_REQUEST, "{}", id);
+        }
+        assert!(!read(&allow).contains("987654321"));
+        // valid (surrounding spaces trimmed)
+        let body = format!("csrf={}&id=%20987654321%20", csrf);
+        assert_eq!(post_body(&st, "/approve", &cookie, &body).await, StatusCode::SEE_OTHER);
+        assert!(read(&allow).contains("987654321 # aprovado 20"));
+        // the form is on the index page
+        let resp = router(st.clone())
+            .oneshot(Request::get("/").header("cookie", &cookie).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(html.contains("action=\"/approve\"") && html.contains("name=\"id\""));
+    }
+
+    #[test]
+    fn pending_parses_old_and_new_lines() {
+        let p = parse_pending(
+            "abc123 1700000000\nbbb222 1700000001 203.0.113.9\nccc333 1700000002 ::1\n\
+ddd444 1700000003 <script>\nBAD 1\nnots 1700000004\neee555 x 1.1.1.1\n",
+        );
+        assert_eq!(
+            p,
+            vec![
+                PendingEntry { id: "abc123".into(), ts: 1700000000, ip: None },
+                PendingEntry { id: "bbb222".into(), ts: 1700000001, ip: Some("203.0.113.9".parse().unwrap()) },
+                PendingEntry { id: "ccc333".into(), ts: 1700000002, ip: Some("::1".parse().unwrap()) },
+                PendingEntry { id: "ddd444".into(), ts: 1700000003, ip: None },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn index_shows_pending_ip() {
+        let (st, _, pending) = setup("ip");
+        std::fs::write(&pending, "abc123 1700000000\nbbb222 1700000001 203.0.113.9\n").unwrap();
+        let (cookie, _) = login_ok(&st).await;
+        let resp = router(st.clone())
+            .oneshot(Request::get("/").header("cookie", &cookie).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(html.contains("<td>bbb222</td><td>2023-11-14 22:13 UTC</td><td>203.0.113.9</td>"), "{}", html);
+        assert!(html.contains("<td>abc123</td><td>2023-11-14 22:13 UTC</td><td>-</td>"), "{}", html);
     }
 
     #[tokio::test]

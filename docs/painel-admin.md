@@ -3,7 +3,8 @@
 Painel web para aprovar, bloquear e remover máquinas da allow-list do hbbs.
 
 - URL: https://everydesk.vpsfachini.online (login por senha única).
-- Pendentes: quando o hbbs nega um `RegisterPk` por falta na allow-list, ele anexa `<id> <unix_ts>` em `PENDING_FILE` (`/var/lib/rustdesk-server/pending.txt`, sem duplicatas, máx. 500 linhas).
+- Pendentes: quando o hbbs nega um `RegisterPk` por falta na allow-list, ele anexa `<id> <unix_ts> <ip_origem>` em `PENDING_FILE` (`/var/lib/rustdesk-server/pending.txt`, sem duplicatas, máx. 500 linhas). O painel mostra o IP na coluna "Origem (IP)" e aceita também linhas antigas `<id> <unix_ts>` (mostra `-`). O IP ajuda a distinguir uma máquina real de um ID inventado por terceiros.
+- Aprovar ID (formulário no topo da página): aprova um ID digitado à mão, com a mesma validação e CSRF dos botões. Serve quando o ID não aparece em Pendentes (fila cheia pelo limite de taxa, ou inundada por IDs falsos) sem precisar de SSH.
 - Aprovar: acrescenta `<id> # aprovado AAAA-MM-DD` em `/var/lib/rustdesk-server/allowed.txt` (o hbbs relê o arquivo sozinho, sem restart).
 - Bloquear: grava em `blocked.txt` (mesma pasta; é só controle do painel, o hbbs nunca lê esse arquivo — o efeito vem de sair do `allowed.txt`), tira de pendentes e aprovados. Remover: tira só do `allowed.txt`, mantendo as demais linhas.
 - Segurança: cookie de sessão HttpOnly/Secure/SameSite=Strict, token CSRF em todo POST, 5 senhas erradas por IP = bloqueio de 10 min. Escuta só em `127.0.0.1:3300`; o Caddy faz o HTTPS.

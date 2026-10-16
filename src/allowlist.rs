@@ -66,9 +66,10 @@ fn parse(content: &str) -> HashSet<String> {
 const PENDING_CAP: usize = 500;
 
 /// Pure update of the pending list: `None` when `id` is already present
-/// (dedupe), otherwise the new content with `"<id> <ts>\n"` appended and the
-/// oldest lines dropped beyond `cap`.
-fn update_pending(content: &str, id: &str, ts: u64, cap: usize) -> Option<String> {
+/// (dedupe), otherwise the new content with `"<id> <ts> <ip>\n"` appended and
+/// the oldest lines dropped beyond `cap`. Older `"<id> <ts>"` lines are kept
+/// as they are (the panel reads both forms).
+fn update_pending(content: &str, id: &str, ts: u64, ip: IpAddr, cap: usize) -> Option<String> {
     let mut lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines
         .iter()
@@ -76,7 +77,7 @@ fn update_pending(content: &str, id: &str, ts: u64, cap: usize) -> Option<String
     {
         return None;
     }
-    let new_line = format!("{} {}", id, ts);
+    let new_line = format!("{} {} {}", id, ts, ip);
     lines.push(&new_line);
     let start = lines.len().saturating_sub(cap);
     let mut out = lines[start..].join("\n");
@@ -163,7 +164,7 @@ fn write_preserving(path: &Path, content: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-fn write_pending(path: &str, id: &str, ts: u64) {
+fn write_pending(path: &str, id: &str, ts: u64, ip: IpAddr) {
     let _io = PENDING_IO.lock().unwrap();
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -173,7 +174,7 @@ fn write_pending(path: &str, id: &str, ts: u64) {
             return;
         }
     };
-    if let Some(new) = update_pending(&content, id, ts, PENDING_CAP) {
+    if let Some(new) = update_pending(&content, id, ts, ip, PENDING_CAP) {
         if let Err(e) = write_preserving(Path::new(path), &new) {
             log::warn!("pending: cannot write {}: {}", path, e);
         }
@@ -198,7 +199,12 @@ pub fn record_pending(id: &str, ip: IpAddr) {
         log::debug!("pending: rate limited {}", id);
         return;
     }
-    hbb_common::tokio::task::spawn_blocking(move || write_pending(&path, &id, ts));
+    // the source address hbbs saw (IPv4-mapped IPv6 shown as plain IPv4)
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    };
+    hbb_common::tokio::task::spawn_blocking(move || write_pending(&path, &id, ts, ip));
 }
 
 #[cfg(test)]
@@ -274,13 +280,26 @@ mod tests {
 
     #[test]
     fn pending_dedupes_and_caps() {
-        let a = update_pending("", "abc123", 1, 3).unwrap();
-        assert_eq!(a, "abc123 1\n");
-        assert!(update_pending(&a, "abc123", 2, 3).is_none());
-        let b = update_pending(&a, "def456", 2, 3).unwrap();
-        let c = update_pending(&b, "ghi789", 3, 3).unwrap();
-        let d = update_pending(&c, "jkl012", 4, 3).unwrap();
-        assert_eq!(d, "def456 2\nghi789 3\njkl012 4\n");
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let a = update_pending("", "abc123", 1, ip, 3).unwrap();
+        assert_eq!(a, "abc123 1 1.2.3.4\n");
+        assert!(update_pending(&a, "abc123", 2, ip, 3).is_none());
+        let b = update_pending(&a, "def456", 2, ip, 3).unwrap();
+        let c = update_pending(&b, "ghi789", 3, ip, 3).unwrap();
+        let d = update_pending(&c, "jkl012", 4, "::1".parse().unwrap(), 3).unwrap();
+        assert_eq!(d, "def456 2 1.2.3.4\nghi789 3 1.2.3.4\njkl012 4 ::1\n");
+    }
+
+    #[test]
+    fn pending_keeps_old_two_field_lines() {
+        let ip: IpAddr = "5.6.7.8".parse().unwrap();
+        let old = "abc123 1\n";
+        // an id already present in the old format is still deduped
+        assert!(update_pending(old, "abc123", 2, ip, 10).is_none());
+        assert_eq!(
+            update_pending(old, "def456", 2, ip, 10).unwrap(),
+            "abc123 1\ndef456 2 5.6.7.8\n"
+        );
     }
 
     #[test]
