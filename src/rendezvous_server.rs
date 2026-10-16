@@ -1,3 +1,4 @@
+use crate::allowlist::Allowlist;
 use crate::common::*;
 use crate::peer::*;
 use hbb_common::{
@@ -13,7 +14,7 @@ use hbb_common::{
     log,
     protobuf::{Message as _, MessageField},
     rendezvous_proto::{
-        register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
+        register_pk_response::Result::{NOT_SUPPORT, TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
     tcp::{listen_any, FramedStream},
@@ -88,6 +89,7 @@ pub struct RendezvousServer {
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
+    allowlist: Option<Arc<Allowlist>>,
 }
 
 enum LoopFailure {
@@ -142,9 +144,16 @@ impl RendezvousServer {
                 mask,
                 local_ip,
             }),
+            allowlist: Allowlist::from_env().map(Arc::new),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
+        if rs.allowlist.is_some() {
+            log::info!(
+                "allowlist: enabled, ALLOWLIST_FILE={}",
+                std::env::var("ALLOWLIST_FILE").unwrap_or_default()
+            );
+        }
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
         let mut listener = create_tcp_listener(port).await?;
@@ -326,6 +335,9 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
                     // B registered
                     if !rp.id.is_empty() {
+                        if self.is_denied(&rp.id) {
+                            return Ok(());
+                        }
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
                         self.update_addr(rp.id, addr, socket).await?;
                         if self.inner.serial > rp.serial {
@@ -344,6 +356,9 @@ impl RendezvousServer {
                         return Ok(());
                     }
                     let id = rk.id;
+                    if self.is_denied(&id) {
+                        return send_rk_res(socket, addr, NOT_SUPPORT).await;
+                    }
                     let ip = addr.ip().to_string();
                     if id.len() < 6 {
                         return send_rk_res(socket, addr, UUID_MISMATCH).await;
@@ -471,6 +486,17 @@ impl RendezvousServer {
         Ok(())
     }
 
+    /// True when an allow-list is configured and `id` is not on it.
+    fn is_denied(&self, id: &str) -> bool {
+        match &self.allowlist {
+            Some(a) if !a.is_allowed(id) => {
+                log::info!("allowlist: denied {}", id);
+                true
+            }
+            _ => false,
+        }
+    }
+
     #[inline]
     async fn handle_tcp(
         &mut self,
@@ -483,6 +509,9 @@ impl RendezvousServer {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
+                    if self.is_denied(&ph.id) {
+                        return false;
+                    }
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
@@ -491,6 +520,9 @@ impl RendezvousServer {
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
+                    if self.is_denied(&rf.id) {
+                        return false;
+                    }
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
